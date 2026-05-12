@@ -64,14 +64,16 @@ class AgeCurve:
         return 1.0 + frac * (self.late_mult - 1.0)
 
 
-# Defaults below are deliberately conservative. RB decay is the steepest (RB age cliff
-# at ~28). QB curve is the flattest (Brady, Brees, Rodgers all played at high levels well
-# into their 40s in modern eras). WR/TE are in between.
+# Defaults are calibrated against real dynasty markets (KTC, KeepTradeCut SF rankings):
+#   - Peak STARTS at the age when a young pedigree starter is producing now, not when
+#     they "fully develop." A 22yo starter is at peak; we don't penalize for being young.
+#   - Pre-peak discount applies only to truly raw/developmental players (≤21).
+#   - RB decay is the steepest (cliff at ~28). QB is the flattest. WR/TE in between.
 DEFAULT_CURVES: dict[str, AgeCurve] = {
-    "QB": AgeCurve(early_age=22, early_mult=0.85, peak_start=25, peak_end=33, late_age=36, late_mult=0.85, late_decay=0.05),
-    "RB": AgeCurve(early_age=21, early_mult=0.90, peak_start=23, peak_end=26, late_age=28, late_mult=0.70, late_decay=0.15),
-    "WR": AgeCurve(early_age=22, early_mult=0.85, peak_start=24, peak_end=29, late_age=31, late_mult=0.80, late_decay=0.10),
-    "TE": AgeCurve(early_age=23, early_mult=0.80, peak_start=25, peak_end=30, late_age=32, late_mult=0.80, late_decay=0.10),
+    "QB": AgeCurve(early_age=20, early_mult=0.95, peak_start=22, peak_end=33, late_age=35, late_mult=0.85, late_decay=0.06),
+    "RB": AgeCurve(early_age=20, early_mult=0.92, peak_start=22, peak_end=26, late_age=28, late_mult=0.70, late_decay=0.15),
+    "WR": AgeCurve(early_age=20, early_mult=0.92, peak_start=22, peak_end=29, late_age=31, late_mult=0.80, late_decay=0.10),
+    "TE": AgeCurve(early_age=21, early_mult=0.90, peak_start=23, peak_end=30, late_age=32, late_mult=0.80, late_decay=0.10),
 }
 
 

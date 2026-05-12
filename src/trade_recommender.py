@@ -80,8 +80,8 @@ from .valuation import ValuedPlayer
 
 # Tuning knobs ----------------------------------------------------------------
 MIN_TW_GAIN = 60.0          # minimum TW delta to even consider an offer
-MAX_PER_PARTNER = 2          # how many offers to keep per partner
-MAX_TOTAL_OFFERS = 12        # global cap
+MAX_PER_PARTNER = 3          # how many offers to keep per partner (bumped from 2 for mega patterns)
+MAX_TOTAL_OFFERS = 15        # global cap (bumped from 12)
 TOP_THEIR_PLAYERS = 6        # how deep into their roster to consider acquiring
 TOP_SELL_TARGETS = 3         # which of my drafted players are sell-candidates
 
@@ -484,6 +484,53 @@ def recommend_offers(
                         score=_score_offer(ev) * activity_mult,
                         summary_line=_summary_line(give, get),
                     ))
+
+        # ---------------------------------------------------------------
+        # Pattern MEGA-A: 3 of my unmade picks → their top player + their unmade pick
+        # (big trade-up: I give up a lot of draft capital to land a tier-1 player + bump)
+        # ---------------------------------------------------------------
+        for tp in their_top[:4]:
+            for tu in their_unmade[:4]:
+                for i, mu1 in enumerate(my_unmade[:4]):
+                    for j, mu2 in enumerate(my_unmade[i + 1:5], start=i + 1):
+                        for mu3 in my_unmade[j + 1:6]:
+                            give = [mu1, mu2, mu3]
+                            get = [tp, tu]
+                            ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
+                            if not _is_acceptable(ev):
+                                continue
+                            partner_offers.append(TradeOffer(
+                                partner_rid=partner_rid,
+                                partner_name=roster_name_fn(partner_rid),
+                                give=give, get=get, eval=ev,
+                                rationale=_build_rationale(ev, give, get, my_summary, their_summary)
+                                          + "; big package",
+                                score=_score_offer(ev) * activity_mult,
+                                summary_line=_summary_line(give, get),
+                            ))
+
+        # ---------------------------------------------------------------
+        # Pattern MEGA-B: 2 of my future picks + 1 unmade startup pick → their top player
+        # (heavy future-for-now overpay for an elite QB exploit)
+        # ---------------------------------------------------------------
+        for tp in their_top[:4]:
+            for i, fp1 in enumerate(my_futures[:4]):
+                for fp2 in my_futures[i + 1:5]:
+                    for mu in my_unmade[:3]:
+                        give = [fp1, fp2, mu]
+                        get = [tp]
+                        ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
+                        if not _is_acceptable(ev):
+                            continue
+                        partner_offers.append(TradeOffer(
+                            partner_rid=partner_rid,
+                            partner_name=roster_name_fn(partner_rid),
+                            give=give, get=get, eval=ev,
+                            rationale=_build_rationale(ev, give, get, my_summary, their_summary)
+                                      + "; big future-for-now",
+                            score=_score_offer(ev) * activity_mult,
+                            summary_line=_summary_line(give, get),
+                        ))
 
         # ---------------------------------------------------------------
         # Pattern C: my future pick + a surplus-position drafted player ↔ their player

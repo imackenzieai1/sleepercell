@@ -44,6 +44,8 @@ from src.projections import (
     explain_scoring_components,
     points_per_game,
 )
+from src.ktc_loader import FantasyCalcResult, KTCLoadResult, fetch_fantasycalc, load_ktc
+from src.normalize import fmt_ba
 from src.simulator import build_consensus_index, simulate_next_picks
 from src.sleeper_client import SleeperClient, SleeperError
 from src.team_analysis import league_needs, positional_scarcity, team_summary
@@ -55,6 +57,35 @@ from src.vbd import VBDContext, best_available_dynamic, likely_next_available_va
 # --------------------------------------------------------------- Setup
 
 st.set_page_config(page_title="Sleeper Cell", layout="wide", initial_sidebar_state="expanded")
+
+
+# ---------------------------------------------------------------- Password gate
+# If `auth.password` is set in Streamlit secrets, gate the entire app behind it.
+# If not set (local dev), the app opens normally. Session-scoped — one entry per browser.
+def _require_password() -> bool:
+    expected = None
+    if hasattr(st, "secrets"):
+        try:
+            expected = st.secrets.get("auth", {}).get("password")
+        except Exception:
+            expected = None
+    if not expected:
+        return True   # no gate configured
+    if st.session_state.get("_pw_ok"):
+        return True
+    st.markdown("<h1>Sleeper Cell</h1>", unsafe_allow_html=True)
+    st.caption("Private — enter the access password.")
+    pw = st.text_input("Password", type="password", label_visibility="collapsed", placeholder="password")
+    if pw and pw == expected:
+        st.session_state["_pw_ok"] = True
+        st.rerun()
+    elif pw:
+        st.error("Wrong password.")
+    return False
+
+
+if not _require_password():
+    st.stop()
 
 # ---------------------------------------------------------------- Global stylesheet
 # One block of CSS keeps the look consistent: data-forward, tight, no decoration.
@@ -276,6 +307,18 @@ with st.sidebar:
     st.markdown("## Identifiers")
     league_id = st.text_input("League ID", value=default_league or "")
     draft_id = st.text_input("Draft ID", value=default_draft or "")
+    default_user = st.secrets.get("sleeper", {}).get("user_id") if hasattr(st, "secrets") else None
+    user_input = st.text_input(
+        "Your username OR user ID",
+        value=default_user or "",
+        help=(
+            "Either works:\n"
+            "• Username — what you log in with (e.g. `tbanks44`)\n"
+            "• User ID — the 18-digit number from your Sleeper profile\n\n"
+            "Used to identify 'your' roster. Leave blank to default to the first roster."
+        ),
+        placeholder="e.g. tbanks44",
+    )
 
     st.markdown("## Strategy")
     strategy = st.radio(
@@ -287,6 +330,31 @@ with st.sidebar:
 
     st.markdown("## Bylaws")
     bylaw_3rr = st.checkbox("Third Round Reversal", value=True)
+
+    st.markdown("## Community values overlay")
+    fc_clicked = st.button(
+        "Fetch latest from FantasyCalc",
+        help="One-click. Pulls live SF dynasty values from api.fantasycalc.com. "
+             "Direct Sleeper-ID join — no fuzzy matching, no CSV. Refreshes nightly.",
+        width="stretch",
+    )
+    if fc_clicked:
+        with st.spinner("Fetching FantasyCalc dynasty values..."):
+            fc_result = fetch_fantasycalc(superflex=True, num_teams=12, ppr=1.0)
+            st.session_state["_fc_result"] = fc_result
+            if fc_result.error:
+                st.error(f"FantasyCalc fetch failed: {fc_result.error}")
+            else:
+                st.success(f"Loaded {fc_result.rows_with_sleeper_id} player values from FantasyCalc.")
+
+    with st.expander("Or upload KTC CSV"):
+        ktc_file = st.file_uploader(
+            "KTC CSV",
+            type=["csv"],
+            help="Paste KeepTradeCut SF dynasty rankings into a CSV "
+                 "(Player,Value or Player,Pos,Value). Fuzzy-matched to Sleeper IDs.",
+            label_visibility="collapsed",
+        )
 
     st.markdown("## Refresh")
     auto = st.checkbox("Auto-refresh (8 s)", value=True)
@@ -350,22 +418,89 @@ state = DraftState(
 
 projections = build_projection_index(projections_raw, cfg)
 index = cached_player_index(players_catalog, dl)
-valued_all = value_population(projections, index, cfg)
+
+# Community values overlay: FantasyCalc fetch (session-sticky) takes precedence;
+# falls back to KTC CSV upload or data/ktc.csv file. Either produces sleeper_id → value.
+ktc_values: dict[str, float] = {}
+ktc_result: KTCLoadResult | None = None
+fc_result_state: FantasyCalcResult | None = st.session_state.get("_fc_result")
+overlay_source: str | None = None
+
+if fc_result_state and fc_result_state.by_player_id:
+    ktc_values = fc_result_state.by_player_id
+    overlay_source = "FantasyCalc"
+else:
+    try:
+        if ktc_file is not None:
+            ktc_result = load_ktc(ktc_file, players_catalog)
+        else:
+            default_ktc_path = DATA_DIR / "ktc.csv"
+            if default_ktc_path.exists():
+                ktc_result = load_ktc(default_ktc_path, players_catalog)
+        if ktc_result:
+            ktc_values = ktc_result.by_player_id
+            overlay_source = "KTC CSV"
+    except Exception as e:
+        st.sidebar.warning(f"KTC load failed: {e}")
+
+valued_all = value_population(projections, index, cfg, ktc_values=ktc_values)
 drafted_ids = state.drafted_ids()
 valued_undrafted = filter_undrafted(valued_all, drafted_ids)
 
-# Identity: pick "you" by trying to find the current user. For Trade Whores hardcode roster 11 if matches.
-my_roster_id = st.session_state.get("my_roster_id")
-if not my_roster_id:
-    # Try matching session user via Sleeper account name in secrets, else default to slot 12 if exists
-    my_user_id = st.secrets.get("sleeper", {}).get("user_id") if hasattr(st, "secrets") else None
-    if my_user_id:
-        for r in rosters:
-            if str(r.get("owner_id")) == str(my_user_id):
-                my_roster_id = r["roster_id"]
+# Surface overlay status in the sidebar so the user can audit
+with st.sidebar:
+    if fc_result_state and fc_result_state.by_player_id:
+        st.caption(
+            f"Overlay: **FantasyCalc** · {fc_result_state.rows_with_sleeper_id} players matched "
+            f"(of {fc_result_state.rows_fetched} fetched)"
+        )
+    elif ktc_result is not None and ktc_result.total_matched > 0:
+        st.caption(
+            f"Overlay: **KTC CSV** · {ktc_result.total_matched} matched "
+            f"({len(ktc_result.unmatched)} unmatched of {ktc_result.rows_read} rows)"
+        )
+        if ktc_result.unmatched:
+            with st.expander("Unmatched names"):
+                st.write(", ".join(ktc_result.unmatched[:50]))
+    elif ktc_result is not None and ktc_result.total_matched == 0:
+        st.warning("KTC file loaded but 0 names matched. Check column headers.")
+
+# Identity: resolve sidebar `user_input` to a roster_id. Accepts:
+#   - numeric Sleeper user_id (e.g. "1032591150932180992")
+#   - username (e.g. "tbanks44" or "TBanks44") — looked up via /v1/user/{username}
+#   - blank → falls back to first roster in the league, with a sidebar warning
+my_roster_id: int | None = None
+my_user_id: str | None = None
+if user_input:
+    uin = user_input.strip()
+    if uin.isdigit():
+        my_user_id = uin
+    else:
+        # Try the literal input first, then lower-case (Sleeper usernames are case-insensitive
+        # in some endpoints, sensitive in others — try both rather than guess).
+        for candidate in (uin, uin.lower()):
+            try:
+                user_obj = client.get_user(candidate)
+            except SleeperError:
+                continue
+            if user_obj and user_obj.get("user_id"):
+                my_user_id = str(user_obj["user_id"])
                 break
-    if not my_roster_id and rosters:
-        my_roster_id = rosters[0]["roster_id"]
+
+if my_user_id:
+    for r in rosters:
+        if str(r.get("owner_id")) == str(my_user_id):
+            my_roster_id = int(r["roster_id"])
+            break
+
+if not my_roster_id and rosters:
+    my_roster_id = int(rosters[0]["roster_id"])
+    if user_input:
+        with st.sidebar:
+            st.warning(
+                f"Couldn't find user '{user_input}' in this league. "
+                f"Defaulting to first roster."
+            )
 
 # Lookup helpers
 uid_to_name = {u["user_id"]: (u.get("display_name") or u["user_id"]) for u in users}
@@ -529,33 +664,145 @@ with tab_best:
         picks_until_my_next=max(0, picks_until_mine),
         positional_scarcity=scarcity,
     )
-    dynamic_top = best_available_dynamic(vctx, top_n=25)
 
     st.markdown(
         f'<div class="sec-head"><h2>Best available</h2>'
-        f'<div class="meta">strategy: {strategy} · horizon: {horizon}y · {picks_until_mine} picks until you</div></div>',
+        f'<div class="meta">strategy: {strategy} · horizon: {horizon}y · {picks_until_mine} picks until you · '
+        f'{len(valued_undrafted)} undrafted players in the pool</div></div>',
         unsafe_allow_html=True,
     )
-    pos_filter = st.multiselect("Position", ["QB", "RB", "WR", "TE"], default=["QB", "RB", "WR", "TE"],
-                                label_visibility="collapsed")
+    filter_cols = st.columns([2, 3, 1])
+    with filter_cols[0]:
+        pos_filter = st.multiselect("Position", ["QB", "RB", "WR", "TE"],
+                                    default=["QB", "RB", "WR", "TE"],
+                                    label_visibility="collapsed")
+    with filter_cols[1]:
+        name_search = st.text_input("Search player", value="", label_visibility="collapsed",
+                                    placeholder="Search by player name (e.g. dart, mahomes)")
+    with filter_cols[2]:
+        show_count = st.number_input("Show N", min_value=20, max_value=300, value=100, step=20,
+                                     label_visibility="collapsed", help="How many rows to display")
 
-    filtered = [v for v in dynamic_top if v.position in pos_filter][:20]
+    # Compute dynamic_top AFTER show_count is defined.
+    dynamic_top = best_available_dynamic(vctx, top_n=int(show_count) + 50)
+
+    name_q = name_search.strip().lower()
+    filtered = [v for v in dynamic_top if v.position in pos_filter]
+    if name_q:
+        filtered = [v for v in filtered if name_q in v.name.lower()]
+    filtered = filtered[: int(show_count)]
     likely = likely_next_available_value(vctx)
+    consensus_idx_local = build_consensus_index(projections, superflex=cfg.superflex)
+    has_ktc = any(v.ktc_value for v in filtered)
     rows = []
     for v in filtered:
         delta_next = round(v.dynasty_value - likely.get(v.position, 0.0), 1)
-        rows.append({
+        adp = consensus_idx_local.get(v.player_id)
+        adp_disp = round(adp, 1) if adp is not None and adp < 500 else None
+        row = {
             "Rank": v.overall_rank,
             "Pos": v.position,
             "Name": v.name,
             "Team": v.team or "FA",
             "Age": v.age or "—",
-            "Season pts (TW scoring)": v.season_points,
-            "Dynasty value": v.dynasty_value,
-            "VBD": v.replacement_delta,
-            "Dynamic VBD (wait?)": delta_next,
-        })
-    st.dataframe(rows, hide_index=True, width="stretch")
+            "Season pts": round(v.season_points),
+            "Dyn": fmt_ba(v.pct_dynasty),
+            "Dyn (raw)": round(v.dynasty_value),
+        }
+        if has_ktc:
+            row["Comm"] = fmt_ba(v.pct_community)
+            row["Fit"] = round(v.league_fit, 2) if v.league_fit else None
+            row["Adj Comm"] = fmt_ba(v.pct_adj_community)
+        row["ADP"] = adp_disp
+        row["VBD"] = fmt_ba(v.pct_vbd)
+        row["Dyn VBD"] = delta_next
+        rows.append(row)
+    if has_ktc:
+        source_label = overlay_source or "Community"
+        ktc_note = (
+            f" · **{source_label} overlay active** — "
+            "Adj community = Community value × league-fit multiplier"
+        )
+    else:
+        ktc_note = (
+            " · click **Fetch from FantasyCalc** in the sidebar (or upload a KTC CSV) "
+            "to enable the community-value overlay"
+        )
+    st.caption(
+        f"Showing {len(rows)} of {len(valued_undrafted)} undrafted players. "
+        f"Use the search box to find a specific player; bump 'Show N' for a wider view.{ktc_note}"
+    )
+    # Per-column tooltips. Hover any header to see what the metric means.
+    column_config = {
+        "Rank": st.column_config.NumberColumn(
+            "Rank",
+            help="Overall rank across all skill-position players, sorted by Dynasty value.",
+        ),
+        "Pos": st.column_config.TextColumn("Pos", help="Fantasy position."),
+        "Age": st.column_config.TextColumn("Age", help="Current age (years)."),
+        "Season pts": st.column_config.NumberColumn(
+            "Season pts",
+            help="Projected fantasy points for the upcoming season computed against "
+                 "YOUR exact scoring_settings (6pt pass TDs, completion bonus, first-down "
+                 "bonuses, TE Premium, etc.). The headline number that nothing else in the "
+                 "industry computes for your specific league.",
+            format="%d",
+        ),
+        "Dyn": st.column_config.TextColumn(
+            "Dyn",
+            help="Dynasty value rank on a 0.000–1.000 scale. 1.000 = top of pool, "
+                 ".500 = median, .000 = bottom. The number means the same thing across "
+                 "every column — direct comparison works.",
+        ),
+        "Dyn (raw)": st.column_config.NumberColumn(
+            "Dyn (raw)",
+            help="Raw Dynasty value: multi-year discounted Season pts × age curve × "
+                 "strategy weights. ~1000-1500 for elite players. Useful when you want the "
+                 "magnitude difference between two players, not just the relative ranking.",
+            format="%d",
+        ),
+        "Comm": st.column_config.TextColumn(
+            "Comm",
+            help="Community value rank on a 0.000–1.000 scale, computed across players with "
+                 "market data. Source: FantasyCalc or KTC depending on what's loaded.",
+        ),
+        "Fit": st.column_config.NumberColumn(
+            "Fit",
+            help="League-fit multiplier. 1.00 = position-median scoring fit. 1.20 = 20%% above "
+                 "median (your scoring rewards this player extra).",
+            format="%.2f",
+        ),
+        "Adj Comm": st.column_config.TextColumn(
+            "Adj Comm",
+            help="Adjusted Community (Community × Fit) on a 0.000–1.000 scale. The community "
+                 "consensus re-tilted for YOUR scoring system. Compare to Comm to spot where "
+                 "your league rewards or penalizes vs the market.",
+        ),
+        "ADP": st.column_config.NumberColumn(
+            "ADP",
+            help="Sleeper Superflex dynasty Average Draft Position — what the average drafter "
+                 "would take this player at. Lower = picked earlier.",
+            format="%.1f",
+        ),
+        "VBD": st.column_config.TextColumn(
+            "VBD",
+            help="Value Based Drafting on a 0.000–1.000 scale. How much more this player is "
+                 "worth than the replacement-level player at their position (QB24 SF, RB36, "
+                 "WR48, TE18), as a rank. Higher = harder to replace at their spot.",
+        ),
+        "Dyn VBD": st.column_config.NumberColumn(
+            "Dyn VBD",
+            help="Dynamic VBD. Value above the player who'll LIKELY still be on the board "
+                 "at your NEXT pick. Positive = take now (you can't wait). Negative = wait, "
+                 "better options exist at other positions this pick.",
+            format="%d",
+        ),
+    }
+    st.dataframe(
+        rows, hide_index=True, width="stretch",
+        height=min(640, 50 + 36 * min(len(rows), 18)),
+        column_config=column_config,
+    )
     st.caption("**Dynamic VBD** = dynasty_value − value of the player likely available at your next pick. "
                "Positive = take now. Negative = you can probably wait at that position.")
 
@@ -667,11 +914,61 @@ with tab_team:
 # ------------------------------ Tab: Tier Alerts ------------------------------
 
 with tab_tiers:
-    tiers = detect_tiers(valued_all)
+    # ----- Metric selector for the entire tab -----
+    # Build a dict of (label → (value_fn, value_formatter)). Options that depend on
+    # KTC overlay or VBD context are only added when the underlying data is present.
+    has_community = any(v.ktc_value for v in valued_all)
+    has_adj_community = any(v.adjusted_ktc for v in valued_all)
+
+    # Dynamic VBD requires the VBDContext. We computed picks_until_mine + scarcity
+    # earlier in the Best Available tab as `vctx`; compute dyn_vbd here from it.
+    from src.vbd import dynamic_vbd  # local import — keeps top of file clean
+    dyn_vbd_map = dynamic_vbd(vctx) if 'vctx' in globals() else {}
+
+    # For Dyn VBD, compute a percentile rank on the fly (it's not stored on ValuedPlayer)
+    from src.normalize import percentile_rank as _pct_rank
+    dyn_vbd_pct = _pct_rank(dyn_vbd_map) if dyn_vbd_map else {}
+
+    tier_metric_options: dict[str, tuple] = {
+        "Dynasty value (our model)": (
+            lambda p: float(p.dynasty_value or 0),
+            lambda p: fmt_ba(p.pct_dynasty),
+        ),
+        "VBD (over replacement)": (
+            lambda p: float(p.replacement_delta or 0),
+            lambda p: fmt_ba(p.pct_vbd),
+        ),
+    }
+    if has_community:
+        tier_metric_options["Community value"] = (
+            lambda p: float(p.ktc_value or 0),
+            lambda p: fmt_ba(p.pct_community),
+        )
+    if has_adj_community:
+        tier_metric_options["Adj community (KTC × fit)"] = (
+            lambda p: float(p.adjusted_ktc or 0),
+            lambda p: fmt_ba(p.pct_adj_community),
+        )
+    if dyn_vbd_pct:
+        tier_metric_options["Dyn VBD (vs likely next available)"] = (
+            lambda p: float(dyn_vbd_map.get(p.player_id, 0) or 0),
+            lambda p: fmt_ba(dyn_vbd_pct.get(p.player_id)),
+        )
+
+    metric_choice = st.selectbox(
+        "Group tiers by",
+        list(tier_metric_options.keys()),
+        index=0,
+        help="Switch the metric used for both tier grouping AND the value displayed "
+             "next to each player. Compare how tier breaks shift across value systems.",
+    )
+    value_fn, value_fmt = tier_metric_options[metric_choice]
+
+    tiers = detect_tiers(valued_all, value_fn=value_fn)
     alerts = tier_cliff_alerts(tiers, drafted_ids)
 
-    st.markdown('<div class="sec-head"><h2>Tier cliff alerts</h2>'
-                f'<div class="meta">{len(alerts)} active</div></div>',
+    st.markdown(f'<div class="sec-head"><h2>Tier cliff alerts</h2>'
+                f'<div class="meta">{len(alerts)} active · grouped by {metric_choice.lower()}</div></div>',
                 unsafe_allow_html=True)
     if alerts:
         alert_rows = [{
@@ -685,27 +982,37 @@ with tab_tiers:
     else:
         st.info("No tier cliffs currently within threshold.")
 
-    st.markdown('<div class="sec-head"><h2>Tiers by position</h2></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec-head"><h2>Tiers by position</h2>'
+                f'<div class="meta">metric: {metric_choice} · drafted players struck through</div></div>',
+                unsafe_allow_html=True)
+    MAX_LINES_PER_TIER = 20
     pcol = st.columns(4)
     for i, pos in enumerate(["QB", "RB", "WR", "TE"]):
         with pcol[i]:
             st.markdown(f"##### {pos}", unsafe_allow_html=True)
             for tier in tiers.get(pos, [])[:6]:
                 undrafted_in_tier = [p for p in tier.players if p.player_id not in drafted_ids]
+                shown = tier.players[:MAX_LINES_PER_TIER]
+                hidden_count = max(0, len(tier.players) - len(shown))
                 lines = []
-                for p in tier.players[:8]:
+                for p in shown:
                     drafted = p.player_id in drafted_ids
                     mark = '<span style="color:#94a3b8;text-decoration:line-through">' if drafted else '<span>'
                     lines.append(
                         f'{mark}{p.name}</span> '
-                        f'<span style="color:var(--muted-2);font-variant-numeric:tabular-nums">{p.dynasty_value:.0f}</span>'
+                        f'<span style="color:var(--muted-2);font-variant-numeric:tabular-nums">{value_fmt(p)}</span>'
                     )
+                footer = (
+                    f'<div style="color:var(--muted-2);font-size:0.7rem;margin-top:2px">+ {hidden_count} more (lower value)</div>'
+                    if hidden_count else ""
+                )
                 st.markdown(
                     f'<div style="font-size:0.75rem;margin-bottom:0.6rem;">'
                     f'<div style="font-weight:600;color:var(--ink-2);margin-bottom:2px">'
                     f'T{tier.tier_number} <span style="color:var(--muted);font-weight:500">'
                     f'· {len(undrafted_in_tier)}/{tier.size} left</span></div>'
                     + "<br>".join(lines) +
+                    footer +
                     "</div>",
                     unsafe_allow_html=True,
                 )
@@ -730,9 +1037,31 @@ with tab_trade:
                 unsafe_allow_html=True)
     st.caption(
         "Scans every partner and every plausible asset combination. Ranks by mutual-win "
-        "(your TW gain × their consensus gain). Only shows offers where you net positive in TW "
-        "and the partner is likely to accept or counter."
+        "— your value gain × the market-value gain on their side. Only surfaces offers where "
+        "you net positive in your model AND the partner is likely to accept or counter."
     )
+    with st.expander("What do 'Your value' and 'Market value' mean?", expanded=False):
+        st.markdown("""
+**Your value** is our model's number — built from per-stat projections × your exact
+league scoring (6pt pass TDs, completion bonus, first-down bonuses, TE Premium, RB rec
+bonus, etc.) × position age curve × your selected strategy (compete/balanced/rebuild)
+summed across your dynasty horizon. This is the TRUTH for your specific league.
+
+**Market value** is what the trade partner is likely seeing — community consensus
+dynasty values. The source is, in order of preference:
+
+1. **FantasyCalc** (if you've clicked *Fetch latest from FantasyCalc* in the sidebar)
+2. **KTC CSV** (if you've uploaded one)
+3. **DynastyProcess** value_2qb (the built-in fallback)
+
+For player picks: both sides use the same scale. For startup draft picks: the pick's
+value is approximated by the consensus-ranked player likely to be available at that
+slot. For 2027/2028 rookie picks: DynastyProcess pick values, scaled to match.
+
+**The exploit** is when the two sides diverge. If you GAIN in Your value AND they
+GAIN in Market value, it's a true mutual-win — they'll accept and you'll come out
+ahead by your math. That's the trade you send.
+""")
 
     # Parse transaction history for trade-activity weighting
     player_name_fn = lambda pid: (projections[pid].name if pid in projections else f"player {pid}")
@@ -760,59 +1089,54 @@ with tab_trade:
                 "Partner": o.partner_name,
                 "You give": ", ".join((a.name if isinstance(a, PlayerAsset) else a.label) for a in o.give),
                 "You get":  ", ".join((a.name if isinstance(a, PlayerAsset) else a.label) for a in o.get),
-                "TW gain": round(o.eval.tw_delta),
-                "Their consensus gain": round(o.eval.consensus_delta_for_them),
+                "Your gain": round(o.eval.tw_delta),
+                "Market gain (theirs)": round(o.eval.consensus_delta_for_them),
                 "Verdict": o.eval.combined,
             })
         st.dataframe(offer_table, hide_index=True, width="stretch",
                      height=min(540, 50 + 36 * len(offer_table)))
 
         # Detailed expandable cards for each offer
-        st.markdown('<h5>Offer detail</h5>', unsafe_allow_html=True)
+        st.markdown('<h5>Trade Finder</h5>', unsafe_allow_html=True)
         for i, o in enumerate(offers, start=1):
             verdict_class = "send" if o.eval.combined in ("SEND IT", "SEND") else (
                 "offer" if o.eval.combined.startswith("OFFER") or "FAIR" in o.eval.combined else "pass"
             )
-            head = f"#{i} → {o.partner_name} · {o.eval.combined} · TW {o.eval.tw_delta:+.0f}"
+            head = f"#{i} → {o.partner_name} · {o.eval.combined} · Your value {o.eval.tw_delta:+.0f}"
             with st.expander(head, expanded=(i == 1)):
                 c_give, c_get, c_kpi = st.columns([2, 2, 1])
+                # Helper: render one asset row with batting averages and raw values
+                def _asset_line(a):
+                    if isinstance(a, PlayerAsset):
+                        vp = next((x for x in valued_all if x.player_id == a.player_id), None)
+                        you_ba = fmt_ba(vp.pct_dynasty) if vp else "—"
+                        mkt_ba = fmt_ba(vp.pct_community if (vp and vp.pct_community is not None) else None)
+                        return (
+                            f"&middot; {pos_chip(a.position)} **{a.name}** "
+                            f"<span style='color:var(--muted);font-size:0.72rem'>"
+                            f"You <b>{you_ba}</b> ({a.tw_value:.0f}) · "
+                            f"Market <b>{mkt_ba}</b> ({a.consensus_value:.0f})</span>"
+                        )
+                    return (
+                        f"&middot; {a.label} "
+                        f"<span style='color:var(--muted);font-size:0.72rem'>"
+                        f"You {a.tw_value:.0f} · Market {a.consensus_value:.0f}</span>"
+                    )
+
                 with c_give:
                     st.markdown("**You give**")
                     for a in o.give:
-                        if isinstance(a, PlayerAsset):
-                            st.markdown(
-                                f"&middot; {pos_chip(a.position)} **{a.name}** "
-                                f"<span style='color:var(--muted);font-size:0.72rem'>"
-                                f"TW {a.tw_value:.0f} · cons {a.consensus_value:.0f}</span>",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.markdown(
-                                f"&middot; {a.label} "
-                                f"<span style='color:var(--muted);font-size:0.72rem'>"
-                                f"TW {a.tw_value:.0f} · cons {a.consensus_value:.0f}</span>",
-                                unsafe_allow_html=True,
-                            )
+                        st.markdown(_asset_line(a), unsafe_allow_html=True)
                 with c_get:
                     st.markdown(f"**You get** (from {o.partner_name})")
                     for a in o.get:
-                        if isinstance(a, PlayerAsset):
-                            st.markdown(
-                                f"&middot; {pos_chip(a.position)} **{a.name}** "
-                                f"<span style='color:var(--muted);font-size:0.72rem'>"
-                                f"TW {a.tw_value:.0f} · cons {a.consensus_value:.0f}</span>",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.markdown(
-                                f"&middot; {a.label} "
-                                f"<span style='color:var(--muted);font-size:0.72rem'>"
-                                f"TW {a.tw_value:.0f} · cons {a.consensus_value:.0f}</span>",
-                                unsafe_allow_html=True,
-                            )
+                        st.markdown(_asset_line(a), unsafe_allow_html=True)
                 with c_kpi:
-                    st.metric("Your TW", f"{o.eval.tw_delta:+.0f}")
-                    st.metric("Their cons.", f"{o.eval.consensus_delta_for_them:+.0f}")
+                    st.metric("Your gain", f"{o.eval.tw_delta:+.0f}",
+                              help="Trade delta in YOUR model (per-stat × your scoring × age curve).")
+                    st.metric("Market gain", f"{o.eval.consensus_delta_for_them:+.0f}",
+                              help="Trade delta in the MARKET (community/FantasyCalc/KTC value) — "
+                                   "what the partner sees on their side. Positive = they think they win.")
 
                 st.markdown(f"<div class='kv'><span class='k'>Why</span>{o.rationale}</div>",
                             unsafe_allow_html=True)
@@ -927,8 +1251,8 @@ with tab_trade:
             f'<div class="verdict {verdict_class}">'
             f'<div class="label">Verdict</div>'
             f'<div class="text">{result.combined}</div>'
-            f'<div class="sub">Your view (TW): {result.tw_delta:+.0f} &middot; '
-            f'Their view (consensus): {result.consensus_delta_for_them:+.0f} &middot; '
+            f'<div class="sub">Your value: {result.tw_delta:+.0f} &middot; '
+            f'Market value (theirs): {result.consensus_delta_for_them:+.0f} &middot; '
             f'Their likely response: {result.their_response}</div>'
             f'</div>',
             unsafe_allow_html=True,
@@ -1034,120 +1358,140 @@ with tab_explain:
         "replacement-level VBD → ranks. Each is shown below for whichever player you pick."
     )
 
-    options = [(v.name, v.player_id, v.season_points, v.dynasty_value, v.overall_rank) for v in valued_all[:300]]
-    choice = st.selectbox(
-        "Pick a player",
-        options,
-        format_func=lambda x: f"#{x[4]:>3} · {x[0]} — {x[2]:.0f} season pts, {x[3]:.0f} dyn value",
+    # Search box → filter the player list → selectbox shows matches
+    search_col, _ = st.columns([2, 3])
+    with search_col:
+        whysearch = st.text_input(
+            "Search player",
+            placeholder="Start typing — e.g. dart, mahomes, bowers",
+            label_visibility="collapsed",
+        )
+    q = whysearch.strip().lower()
+    if q:
+        matches = [v for v in valued_all if q in v.name.lower()][:50]
+    else:
+        matches = valued_all[:50]  # default: top 50 by Dyn value
+
+    if not matches:
+        st.warning(f"No players matched '{whysearch}'.")
+        st.stop()
+
+    selected = st.selectbox(
+        "Match",
+        matches,
+        format_func=lambda v: f"{v.name}  ·  {v.position} {v.team or 'FA'}  ·  {v.age or '?'}y  ·  Dyn {fmt_ba(v.pct_dynasty)}",
+        label_visibility="collapsed",
     )
-    if choice:
-        pid = choice[1]
-        proj = projections[pid]
-        vp = next((v for v in valued_all if v.player_id == pid), None)
+    pid = selected.player_id
+    proj = projections[pid]
+    vp = selected
 
-        st.markdown(
-            f"### {proj.name} — {pos_chip(proj.position)} · {proj.team or 'FA'} · {proj.age or '?'}y · "
-            f"<span style='color:#94a3b8'>overall #{vp.overall_rank if vp else '?'} · "
-            f"{proj.position}#{vp.position_rank if vp else '?'}</span>",
-            unsafe_allow_html=True,
+    st.markdown(
+        f"### {proj.name} — {pos_chip(proj.position)} · {proj.team or 'FA'} · {proj.age or '?'}y · "
+        f"<span style='color:#94a3b8'>overall #{vp.overall_rank} · "
+        f"{proj.position}#{vp.position_rank}</span>",
+        unsafe_allow_html=True,
+    )
+
+    # Top KPI strip — common-sized batting averages + raw values side by side
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
+    col_a.metric("Season pts", f"{proj.league_points:.0f}",
+                 delta=f"{proj.league_points - proj.sleeper_pts_ppr:+.0f} vs default",
+                 help="Projected fantasy points this season under YOUR league's exact scoring_settings.")
+    col_b.metric("Dyn", fmt_ba(vp.pct_dynasty),
+                 help=f"Dynasty value rank (raw {vp.dynasty_value:.0f}). 1.000 = top of pool.")
+    col_c.metric("Comm", fmt_ba(vp.pct_community) if vp.pct_community is not None else "—",
+                 help=f"Community-value rank (raw {(vp.ktc_value or 0):.0f}).")
+    col_d.metric("Adj Comm", fmt_ba(vp.pct_adj_community) if vp.pct_adj_community is not None else "—",
+                 help="Community value × your league-fit multiplier.")
+    col_e.metric("VBD", fmt_ba(vp.pct_vbd),
+                 help=f"Value over replacement (raw {vp.replacement_delta:+.0f}).")
+
+    # ------ Stage 1 + 2: projection × scoring -----------------------------
+    st.divider()
+    st.markdown("##### Stage 1 + 2 — Per-stat projection × your league scoring")
+    st.caption(
+        f"Source: Sleeper bulk projections (provider: {proj.company or 'rotowire'}). "
+        f"Last updated: {(datetime.fromtimestamp(proj.last_modified_ms/1000).strftime('%b %d') if proj.last_modified_ms else '?')}. "
+        "We multiply each stat by your scoring_settings and sum."
+    )
+    all_comps = explain_scoring_components(proj.stats, cfg, top_n=20)
+    score_rows = [
+        {
+            "Stat": stat,
+            "Value": f"{proj.stats.get(stat, 0):.1f}",
+            "Multiplier": f"×{cfg.scoring.get(stat, 0):+g}",
+            "Points": round(pts, 2),
+        }
+        for stat, pts in all_comps
+    ]
+    # Add a TOTAL row so the math is explicit
+    score_rows.append({"Stat": "— TOTAL —", "Value": "", "Multiplier": "", "Points": round(proj.league_points, 2)})
+    st.dataframe(score_rows, hide_index=True, width="stretch")
+
+    # ------ Stage 3: dynasty curve ----------------------------------------
+    st.divider()
+    st.markdown("##### Stage 3 — Dynasty curve (age decay × strategy weight)")
+    st.caption(
+        f"Strategy: **{cfg.strategy}** · Horizon: **{cfg.age_horizon_years} years**. "
+        "Each future year is multiplied by an age-curve factor (position-specific) and a "
+        "strategy weight (compete frontloads, rebuild backloads)."
+    )
+    breakdown = dynasty_value_breakdown(
+        season_points=proj.league_points,
+        position=proj.position,
+        age=proj.age,
+        strategy=cfg.strategy,
+        horizon_years=cfg.age_horizon_years,
+    )
+    breakdown_rows = [
+        {
+            "Year": f"Y{r['year']} (age {r['age']})" if r['age'] is not None else f"Y{r['year']}",
+            "Age multiplier": r["age_mult"],
+            "Strategy weight": r["strategy_weight"],
+            "Contribution (pts)": r["points"],
+        }
+        for r in breakdown
+    ]
+    breakdown_rows.append({
+        "Year": "— TOTAL = dynasty value —",
+        "Age multiplier": "",
+        "Strategy weight": "",
+        "Contribution (pts)": round(sum(r["points"] for r in breakdown), 2),
+    })
+    st.dataframe(breakdown_rows, hide_index=True, width="stretch")
+
+    # ------ Stage 4: VBD context ------------------------------------------
+    st.divider()
+    st.markdown("##### Stage 4 — VBD (value over replacement)")
+    # Compute the replacement player at this position
+    same_pos_valued = [v for v in valued_all if v.position == proj.position]
+    from src.valuation import scaled_replacement_ranks  # local import: not on module hot path
+    reps = scaled_replacement_ranks(cfg.teams)
+    if cfg.superflex:
+        reps["QB"] = max(reps["QB"], 24)
+    rep_idx = min(reps.get(proj.position, len(same_pos_valued)), len(same_pos_valued)) - 1
+    rep_player = same_pos_valued[rep_idx] if rep_idx >= 0 else None
+
+    vbd_a, vbd_b, vbd_c = st.columns(3)
+    if vp:
+        vbd_a.metric("Your value", f"{vp.dynasty_value:.0f}")
+    if rep_player:
+        vbd_b.metric(
+            f"{proj.position} replacement (#{rep_idx + 1})",
+            f"{rep_player.dynasty_value:.0f}",
+            help=f"{rep_player.name} — the player whose value sets the replacement floor in this SF/dynasty league.",
         )
+    if vp and rep_player:
+        vbd_c.metric("VBD (delta)", f"{vp.replacement_delta:+.0f}")
 
-        col_metrics_a, col_metrics_b, col_metrics_c, col_metrics_d = st.columns(4)
-        col_metrics_a.metric("Season pts (TW)", f"{proj.league_points:.0f}")
-        col_metrics_b.metric("Sleeper default ppr", f"{proj.sleeper_pts_ppr:.0f}",
-                             delta=f"{proj.league_points - proj.sleeper_pts_ppr:+.0f} vs default")
-        col_metrics_c.metric("Dynasty value", f"{vp.dynasty_value:.0f}" if vp else "—")
-        col_metrics_d.metric(
-            "DP Superflex (ref)",
-            f"{vp.dp_value_2qb:.0f}" if (vp and vp.dp_value_2qb) else "—",
-            help="DynastyProcess generic SF value, for sanity-check. Different units than ours — compare order, not absolute.",
-        )
-
-        # ------ Stage 1 + 2: projection × scoring -----------------------------
-        st.divider()
-        st.markdown("##### Stage 1 + 2 — Per-stat projection × your league scoring")
-        st.caption(
-            f"Source: Sleeper bulk projections (provider: {proj.company or 'rotowire'}). "
-            f"Last updated: {(datetime.fromtimestamp(proj.last_modified_ms/1000).strftime('%b %d') if proj.last_modified_ms else '?')}. "
-            "We multiply each stat by your scoring_settings and sum."
-        )
-        all_comps = explain_scoring_components(proj.stats, cfg, top_n=20)
-        score_rows = [
-            {
-                "Stat": stat,
-                "Value": f"{proj.stats.get(stat, 0):.1f}",
-                "Multiplier": f"×{cfg.scoring.get(stat, 0):+g}",
-                "Points": round(pts, 2),
-            }
-            for stat, pts in all_comps
-        ]
-        # Add a TOTAL row so the math is explicit
-        score_rows.append({"Stat": "— TOTAL —", "Value": "", "Multiplier": "", "Points": round(proj.league_points, 2)})
-        st.dataframe(score_rows, hide_index=True, width="stretch")
-
-        # ------ Stage 3: dynasty curve ----------------------------------------
-        st.divider()
-        st.markdown("##### Stage 3 — Dynasty curve (age decay × strategy weight)")
-        st.caption(
-            f"Strategy: **{cfg.strategy}** · Horizon: **{cfg.age_horizon_years} years**. "
-            "Each future year is multiplied by an age-curve factor (position-specific) and a "
-            "strategy weight (compete frontloads, rebuild backloads)."
-        )
-        breakdown = dynasty_value_breakdown(
-            season_points=proj.league_points,
-            position=proj.position,
-            age=proj.age,
-            strategy=cfg.strategy,
-            horizon_years=cfg.age_horizon_years,
-        )
-        breakdown_rows = [
-            {
-                "Year": f"Y{r['year']} (age {r['age']})" if r['age'] is not None else f"Y{r['year']}",
-                "Age multiplier": r["age_mult"],
-                "Strategy weight": r["strategy_weight"],
-                "Contribution (pts)": r["points"],
-            }
-            for r in breakdown
-        ]
-        breakdown_rows.append({
-            "Year": "— TOTAL = dynasty value —",
-            "Age multiplier": "",
-            "Strategy weight": "",
-            "Contribution (pts)": round(sum(r["points"] for r in breakdown), 2),
-        })
-        st.dataframe(breakdown_rows, hide_index=True, width="stretch")
-
-        # ------ Stage 4: VBD context ------------------------------------------
-        st.divider()
-        st.markdown("##### Stage 4 — VBD (value over replacement)")
-        # Compute the replacement player at this position
-        same_pos_valued = [v for v in valued_all if v.position == proj.position]
-        from src.valuation import scaled_replacement_ranks  # local import: not on module hot path
-        reps = scaled_replacement_ranks(cfg.teams)
-        if cfg.superflex:
-            reps["QB"] = max(reps["QB"], 24)
-        rep_idx = min(reps.get(proj.position, len(same_pos_valued)), len(same_pos_valued)) - 1
-        rep_player = same_pos_valued[rep_idx] if rep_idx >= 0 else None
-
-        vbd_a, vbd_b, vbd_c = st.columns(3)
-        if vp:
-            vbd_a.metric("Your value", f"{vp.dynasty_value:.0f}")
-        if rep_player:
-            vbd_b.metric(
-                f"{proj.position} replacement (#{rep_idx + 1})",
-                f"{rep_player.dynasty_value:.0f}",
-                help=f"{rep_player.name} — the player whose value sets the replacement floor in this SF/dynasty league.",
-            )
-        if vp and rep_player:
-            vbd_c.metric("VBD (delta)", f"{vp.replacement_delta:+.0f}")
-
-        # ------ Stage 5: final ranks ------------------------------------------
-        st.divider()
-        st.markdown("##### Stage 5 — Final ranks")
-        if vp:
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Overall rank", f"#{vp.overall_rank}")
-            r2.metric(f"{proj.position} rank", f"#{vp.position_rank}")
-            r3.metric("ID match method", vp.match_method,
-                      help="How we linked this player to DynastyProcess data. 'sleeper_id' is the canonical bridge; "
-                           "'fuzzy_name' fell back to name matching; 'unmatched' means no DP cross-walk found.")
+    # ------ Stage 5: final ranks ------------------------------------------
+    st.divider()
+    st.markdown("##### Stage 5 — Final ranks")
+    if vp:
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Overall rank", f"#{vp.overall_rank}")
+        r2.metric(f"{proj.position} rank", f"#{vp.position_rank}")
+        r3.metric("ID match method", vp.match_method,
+                  help="How we linked this player to DynastyProcess data. 'sleeper_id' is the canonical bridge; "
+                       "'fuzzy_name' fell back to name matching; 'unmatched' means no DP cross-walk found.")

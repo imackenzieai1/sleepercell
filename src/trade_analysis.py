@@ -175,16 +175,36 @@ def _combine(your: str, theirs: str) -> str:
 
 
 def player_asset(player_id: str, valued: list[ValuedPlayer]) -> PlayerAsset | None:
+    """Build a PlayerAsset from a ValuedPlayer.
+
+    `tw_value` (our model side) = dynasty_value — per-stat projection × YOUR
+    league's scoring × age curve × strategy weights.
+
+    `consensus_value` (market side) prefers community values in this order:
+        1. ktc_value (from FantasyCalc fetch or KTC CSV) — SF dynasty consensus
+        2. dp_value_2qb (DynastyProcess SF) — fallback if no community overlay
+        3. dp_value_1qb — last resort
+
+    When the user has loaded a Community overlay, the trade math automatically
+    uses it for the "market" side. The two columns in the UI ("Your value" and
+    "Market value") are now in self-consistent units throughout the calculator.
+    """
     v = next((x for x in valued if x.player_id == player_id), None)
     if v is None:
         return None
+    market_value = float(
+        v.ktc_value
+        or v.dp_value_2qb
+        or v.dp_value_1qb
+        or 0.0
+    )
     return PlayerAsset(
         player_id=v.player_id,
         name=v.name,
         position=v.position,
         age=v.age,
         tw_value=v.dynasty_value,
-        consensus_value=float(v.dp_value_2qb or v.dp_value_1qb or 0.0),
+        consensus_value=market_value,
     )
 
 

@@ -46,6 +46,16 @@ class ValuedPlayer:
     sleeper_pts_ppr: float | None = None
     dp_value_2qb: float | None = None
     dp_value_1qb: float | None = None
+    # KTC / FantasyCalc overlay (optional, populated when a community-values overlay is loaded)
+    ktc_value: float | None = None
+    league_fit: float | None = None      # 1.0 = position-median; >1 = above-median TW fit
+    adjusted_ktc: float | None = None    # ktc_value × league_fit
+    # Common-size percentile ranks (0-100), computed in value_population() across the population.
+    # Same number means same thing across metrics: e.g. 99 = top 1% by that metric.
+    pct_dynasty: float | None = None
+    pct_vbd: float | None = None
+    pct_community: float | None = None
+    pct_adj_community: float | None = None
     match_method: str = "unmatched"
 
 
@@ -59,12 +69,47 @@ DEFAULT_REPLACEMENT_RANKS = {
 }
 
 
+def compute_league_fit(
+    projections: dict[str, PlayerProjection],
+    *,
+    min_baseline_pts: float = 30.0,
+) -> dict[str, float]:
+    """Per-position-normalized league fit = (TW pts / default PPR) ÷ position median.
+
+    1.0  → average TW fit for the position
+    >1.0 → this league's scoring rewards this player more than the median peer
+    <1.0 → less than median fit (e.g., low-volume QB in a completion-bonus league)
+
+    Used as a multiplier on KTC values: KTC × fit = adjusted-KTC.
+    """
+    from collections import defaultdict
+
+    by_pos_fits: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for pid, proj in projections.items():
+        std = float(proj.sleeper_pts_ppr or 0)
+        if std < min_baseline_pts or proj.league_points <= 0:
+            continue
+        fit = proj.league_points / std
+        by_pos_fits[proj.position].append((pid, fit))
+
+    out: dict[str, float] = {}
+    for pos, lst in by_pos_fits.items():
+        fits_only = sorted(f for _, f in lst)
+        if not fits_only:
+            continue
+        median = fits_only[len(fits_only) // 2] or 1.0
+        for pid, fit in lst:
+            out[pid] = round(fit / median, 4)
+    return out
+
+
 def value_population(
     projections: dict[str, PlayerProjection],
     index: PlayerIndex,
     cfg: LeagueConfig,
     *,
     replacement_ranks: dict[str, int] | None = None,
+    ktc_values: dict[str, float] | None = None,
 ) -> list[ValuedPlayer]:
     """Score and rank every player with a projection.
 
@@ -86,6 +131,9 @@ def value_population(
     else:
         replacement_ranks = {**replacement_ranks, "QB": min(replacement_ranks["QB"], 14)}
 
+    # Pre-compute league-fit per player (used to adjust KTC values)
+    league_fits = compute_league_fit(projections) if ktc_values else {}
+
     # 1) Build initial valued list (no ranks yet)
     interim: list[ValuedPlayer] = []
     for pid, proj in projections.items():
@@ -98,6 +146,9 @@ def value_population(
             strategy=cfg.strategy,
             horizon_years=cfg.age_horizon_years,
         )
+        ktc_v = (ktc_values or {}).get(pid)
+        fit_v = league_fits.get(pid) if ktc_v else None
+        adj_ktc = round(ktc_v * fit_v, 1) if (ktc_v and fit_v) else None
         interim.append(
             ValuedPlayer(
                 player_id=pid,
@@ -112,6 +163,9 @@ def value_population(
                 sleeper_pts_ppr=proj.sleeper_pts_ppr,
                 dp_value_2qb=(record.dp_value_2qb if record else None),
                 dp_value_1qb=(record.dp_value_1qb if record else None),
+                ktc_value=ktc_v,
+                league_fit=fit_v,
+                adjusted_ktc=adj_ktc,
                 match_method=(record.match_method if record else "unmatched"),
             )
         )
@@ -137,6 +191,20 @@ def value_population(
     for vp in interim:
         rv = replacement_values.get(vp.position, 0.0)
         vp.replacement_delta = round(vp.dynasty_value - rv, 3)
+
+    # 4) Common-size: compute 0-100 percentile rank per metric.
+    # Each player's pct_X tells you "this player is in the top (100-X)% of all skill players
+    # ranked by that metric." Same number means the same thing across every column in the UI.
+    from .normalize import attach_percentiles
+    attach_percentiles(
+        interim,
+        attr_pairs=[
+            ("dynasty_value",     "pct_dynasty"),
+            ("replacement_delta", "pct_vbd"),
+            ("ktc_value",         "pct_community"),
+            ("adjusted_ktc",      "pct_adj_community"),
+        ],
+    )
 
     return interim
 

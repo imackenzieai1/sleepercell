@@ -176,8 +176,12 @@ def simulate_next_picks(
     # Pre-index valued for fast id lookup
     by_id = {v.player_id: v for v in valued_all}
 
-    # Players drafted so far (cascading through simulation)
-    simulated_drafted = set(state.drafted_ids())
+    # Two PARALLEL cascading drafted sets — one for the primary engine, one for the alt.
+    # Each engine effectively runs its own simulation of the same draft, so the "alt"
+    # column doesn't repeat the same player across multiple upcoming picks (which it
+    # used to do when both engines shared a single drafted set).
+    primary_drafted = set(state.drafted_ids())
+    alt_drafted = set(state.drafted_ids()) if include_alt_choice else None
 
     # Pre-build each roster's existing draft picks (player_ids)
     real_picks_by_roster: dict[int, list[str]] = {}
@@ -208,11 +212,11 @@ def simulate_next_picks(
         mean_age = sum(ages) / len(ages) if ages else None
         stance = _infer_stance(mean_age)
 
-        # Score candidates by the selected ranking source
+        # Primary engine: scored against its own cascading drafted set
         primary_pick = _best_candidate(
             valued_all=valued_all,
             by_id=by_id,
-            simulated_drafted=simulated_drafted,
+            simulated_drafted=primary_drafted,
             consensus_index=consensus_index,
             needs=needs,
             stance=stance,
@@ -223,14 +227,14 @@ def simulate_next_picks(
         if primary_pick is None:
             continue
 
-        # Compute the alt-engine's pick for the same slot (uses same drafted set, before primary)
+        # Alt engine: scored against ITS OWN cascading drafted set
         alt_pick = None
-        if include_alt_choice:
+        if include_alt_choice and alt_drafted is not None:
             alt_source = "optimal" if ranking_source == "consensus" else "consensus"
-            alt_pick = _best_candidate(
+            alt_candidate = _best_candidate(
                 valued_all=valued_all,
                 by_id=by_id,
-                simulated_drafted=simulated_drafted,
+                simulated_drafted=alt_drafted,
                 consensus_index=consensus_index,
                 needs=needs,
                 stance=stance,
@@ -238,9 +242,14 @@ def simulate_next_picks(
                 candidate_pool_size=candidate_pool_size,
                 source=alt_source,
             )
-            # Only flag alt if it's a different player
-            if alt_pick and alt_pick.player_id == primary_pick.player_id:
-                alt_pick = None
+            if alt_candidate and alt_candidate.player_id != primary_pick.player_id:
+                # Real divergence — surface it
+                alt_pick = alt_candidate
+                alt_drafted.add(alt_candidate.player_id)
+            else:
+                # Both engines converge OR no alt found. Advance alt cascade with primary's pick
+                # so the alt engine continues to track the actual draft state.
+                alt_drafted.add(primary_pick.player_id)
 
         why = _build_why(primary_pick, counts, needs, targets, stance, ranking_source=ranking_source)
 
@@ -268,7 +277,7 @@ def simulate_next_picks(
             inferred_stance=stance,
             mean_age_drafted=round(mean_age, 1) if mean_age is not None else None,
         ))
-        simulated_drafted.add(primary_pick.player_id)
+        primary_drafted.add(primary_pick.player_id)
         simulated_picks_by_roster.setdefault(owner_rid, []).append(primary_pick.player_id)
 
     return predictions
