@@ -33,10 +33,12 @@ from src.trade_analysis import (
     pick_asset,
     player_asset,
 )
-from src.trade_recommender import recommend_offers
+from src.trade_recommender import SEARCH_DEPTHS, plan_acquisition, recommend_offers
 from src.transaction_history import (
     activity_per_roster,
+    grade_trades,
     parse_trades,
+    to_graded_rows,
     to_normalized_rows,
 )
 from src.projections import (
@@ -87,81 +89,240 @@ def _require_password() -> bool:
 if not _require_password():
     st.stop()
 
+# ---------------------------------------------------------------- Theme selector
+# Robinhood-inspired: clean, soft, breathable. Light = day mode (white canvas, slate ink,
+# sage green for gains). Dark = night mode (near-black canvas, off-white ink, neon green
+# for gains). Toggle lives in the sidebar; persisted in session_state.
+# We inject the base stylesheet ALWAYS, then layer a theme-specific override that
+# rewrites the CSS variables. Streamlit reruns re-inject both blocks — instant flip.
+if "theme" not in st.session_state:
+    st.session_state["theme"] = "Light"
+
 # ---------------------------------------------------------------- Global stylesheet
-# One block of CSS keeps the look consistent: data-forward, tight, no decoration.
+# Modern dashboard feel: subtle elevation (shadows over borders), strong type hierarchy,
+# generous whitespace between sections, color used ONLY for semantic meaning.
 st.markdown("""
 <style>
 :root {
-  --bg-page: #ffffff;
-  --bg-soft: #f8fafc;
-  --bg-sidebar: #fafbfc;
-  --border: #e5e7eb;
-  --border-soft: #f1f5f9;
-  --ink: #0f172a;
-  --ink-2: #334155;
-  --muted: #64748b;
-  --muted-2: #94a3b8;
-  --accent: #0f172a;
-  --good: #059669;
-  --warn: #d97706;
-  --bad:  #dc2626;
+  /* LIGHT (default) — Robinhood-Day palette */
+  --bg-page:     #ffffff;
+  --bg-soft:     #f7f9fc;
+  --bg-card:     #ffffff;
+  --bg-sidebar:  #fafbfd;
+  --bg-elevated: #ffffff;
+  --border:      #e6eaf0;
+  --border-soft: #eef1f6;
+  --ring:        rgba(15, 23, 42, 0.06);
+  --shadow-sm:   0 1px 2px 0 rgba(15, 23, 42, 0.04);
+  --shadow-md:   0 4px 14px -4px rgba(15, 23, 42, 0.08), 0 2px 6px -3px rgba(15, 23, 42, 0.04);
+  --shadow-lg:   0 12px 32px -8px rgba(15, 23, 42, 0.12), 0 4px 12px -4px rgba(15, 23, 42, 0.06);
+  --ink:         #0c1320;
+  --ink-2:       #2b3445;
+  --ink-3:       #475467;
+  --muted:       #667085;
+  --muted-2:     #98a2b3;
+  --muted-3:     #d0d5dd;
+  --accent:      #0c1320;
+  --good:        #15803d;
+  --good-bright: #16a34a;
+  --good-soft:   #e6f5ec;
+  --warn:        #b45309;
+  --warn-soft:   #fff4e0;
+  --bad:         #b91c1c;
+  --bad-soft:    #fdecec;
 }
+
+/* Reset Streamlit chrome */
 .block-container {
-  padding-top: 1.25rem !important;
-  padding-bottom: 2rem !important;
+  padding: 1.5rem 2rem 3rem !important;
   max-width: 1500px;
 }
 [data-testid="stHeader"] { background: transparent; height: 0; }
-html, body, [class*="css"] {
-  font-family: ui-sans-serif, system-ui, -apple-system, "Inter", "Segoe UI", Roboto, sans-serif;
-  font-feature-settings: "tnum" 1, "ss01" 1;
-}
-h1 { font-size: 1.35rem !important; font-weight: 700 !important; letter-spacing: -0.01em; margin: 0 0 0.15rem 0 !important; color: var(--ink); }
-h2 { font-size: 1rem !important; font-weight: 600 !important; margin-top: 1.2rem !important; margin-bottom: 0.4rem !important; letter-spacing: -0.005em; color: var(--ink); }
-h3, .stMarkdown h3 { font-size: 0.72rem !important; font-weight: 700 !important; color: var(--muted) !important; text-transform: uppercase !important; letter-spacing: 0.08em !important; margin-top: 0.8rem !important; margin-bottom: 0.4rem !important; }
-.stMarkdown h4, h4 { font-size: 0.85rem !important; font-weight: 600 !important; color: var(--ink) !important; margin-top: 0.5rem !important; margin-bottom: 0.3rem !important; }
-.stMarkdown h5, h5 { font-size: 0.78rem !important; font-weight: 600 !important; color: var(--ink-2) !important; text-transform: uppercase !important; letter-spacing: 0.06em !important; margin-top: 0.8rem !important; margin-bottom: 0.3rem !important; }
+[data-testid="stToolbar"] { right: 0.75rem; top: 0.5rem; }
+footer, [data-testid="stStatusWidget"] { display: none !important; }
 
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] { gap: 0 !important; border-bottom: 1px solid var(--border) !important; margin-bottom: 1rem !important; }
-.stTabs [data-baseweb="tab"] { padding: 0.45rem 0.9rem !important; font-size: 0.82rem !important; font-weight: 600 !important; color: var(--muted) !important; }
-.stTabs [aria-selected="true"] { color: var(--ink) !important; border-bottom: 2px solid var(--ink) !important; }
+/* Typography */
+html, body, [class*="css"] {
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: "cv11" 1, "ss01" 1, "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+  color: var(--ink);
+}
+h1 {
+  font-size: 1.65rem !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin: 0 0 0.2rem 0 !important;
+  color: var(--ink);
+}
+h2 {
+  font-size: 1.05rem !important;
+  font-weight: 650 !important;
+  letter-spacing: -0.01em;
+  margin: 1.5rem 0 0.5rem 0 !important;
+  color: var(--ink);
+}
+h3, .stMarkdown h3 {
+  font-size: 0.7rem !important;
+  font-weight: 700 !important;
+  color: var(--muted) !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.09em !important;
+  margin: 1rem 0 0.5rem 0 !important;
+}
+.stMarkdown h4, h4 {
+  font-size: 0.88rem !important;
+  font-weight: 600 !important;
+  color: var(--ink) !important;
+  margin: 0.75rem 0 0.3rem 0 !important;
+}
+.stMarkdown h5, h5 {
+  font-size: 0.72rem !important;
+  font-weight: 600 !important;
+  color: var(--ink-3) !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.08em !important;
+  margin: 1rem 0 0.4rem 0 !important;
+}
+
+/* Tabs — bolder selected state, subtle hover */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 0.25rem !important;
+  border-bottom: 1px solid var(--border) !important;
+  margin-bottom: 1.5rem !important;
+  padding-bottom: 0 !important;
+}
+.stTabs [data-baseweb="tab"] {
+  padding: 0.55rem 1rem !important;
+  font-size: 0.83rem !important;
+  font-weight: 550 !important;
+  color: var(--muted) !important;
+  border-radius: 6px 6px 0 0;
+  transition: color 120ms ease, background 120ms ease;
+}
+.stTabs [data-baseweb="tab"]:hover { color: var(--ink-2) !important; background: var(--bg-soft) !important; }
+.stTabs [aria-selected="true"] {
+  color: var(--ink) !important;
+  border-bottom: 2px solid var(--accent) !important;
+  background: transparent !important;
+}
 .stTabs [data-baseweb="tab-highlight"] { display: none !important; }
 
-/* Sidebar */
-[data-testid="stSidebar"] { background: var(--bg-sidebar); border-right: 1px solid var(--border); }
-[data-testid="stSidebar"] .stMarkdown h2 { font-size: 0.7rem !important; color: var(--muted-2) !important; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 1rem !important; }
-[data-testid="stSidebar"] label p { font-size: 0.82rem; }
+/* Sidebar — cleaner, more breathable */
+[data-testid="stSidebar"] {
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+}
+[data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
+[data-testid="stSidebar"] .stMarkdown h2 {
+  font-size: 0.68rem !important;
+  color: var(--muted-2) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin: 1.25rem 0 0.5rem 0 !important;
+}
+[data-testid="stSidebar"] label p { font-size: 0.82rem; color: var(--ink-3); }
 [data-testid="stSidebar"] .stRadio label { font-size: 0.78rem !important; }
+[data-testid="stSidebar"] [data-testid="stTextInput"] input,
+[data-testid="stSidebar"] [data-testid="stNumberInput"] input { font-size: 0.85rem; }
 
-/* Metric tiles */
-[data-testid="stMetric"] { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem 0.7rem; }
-[data-testid="stMetricLabel"] { font-size: 0.65rem !important; color: var(--muted) !important; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
-[data-testid="stMetricValue"] { font-size: 1.25rem !important; font-weight: 700 !important; color: var(--ink) !important; font-variant-numeric: tabular-nums; }
-[data-testid="stMetricDelta"] { font-size: 0.7rem !important; }
+/* Metric tiles — subtle elevation, no harsh border */
+[data-testid="stMetric"] {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 0.75rem 0.95rem;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 150ms ease;
+}
+[data-testid="stMetric"]:hover { box-shadow: var(--shadow-md); }
+[data-testid="stMetricLabel"] {
+  font-size: 0.66rem !important;
+  color: var(--muted) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  font-weight: 600;
+}
+[data-testid="stMetricValue"] {
+  font-size: 1.4rem !important;
+  font-weight: 700 !important;
+  color: var(--ink) !important;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+[data-testid="stMetricDelta"] { font-size: 0.7rem !important; opacity: 0.8; }
 
-/* DataFrames */
-[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 4px; }
+/* DataFrames — soft elevation, cleaner rows */
+[data-testid="stDataFrame"] {
+  border: 1px solid var(--border-soft) !important;
+  border-radius: 8px !important;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+/* Inputs — soft borders, subtle focus ring */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-baseweb="select"] > div {
+  border-radius: 6px !important;
+  border-color: var(--border) !important;
+  font-size: 0.85rem;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+[data-testid="stTextInput"] input:focus,
+[data-testid="stNumberInput"] input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--ring) !important;
+}
+
+/* Buttons — match the dashboard feel */
+[data-testid="baseButton-secondary"], .stButton button {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 6px !important;
+  font-size: 0.82rem !important;
+  font-weight: 550 !important;
+  color: var(--ink-2) !important;
+  padding: 0.4rem 0.85rem !important;
+  box-shadow: var(--shadow-sm);
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+.stButton button:hover { background: var(--bg-soft) !important; box-shadow: var(--shadow-md); }
+.stButton button:active { transform: translateY(1px); }
 
 /* Captions */
-[data-testid="stCaptionContainer"] p, .caption { color: var(--muted) !important; font-size: 0.72rem !important; font-style: normal !important; line-height: 1.45; }
+[data-testid="stCaptionContainer"] p, .caption {
+  color: var(--muted) !important;
+  font-size: 0.74rem !important;
+  font-style: normal !important;
+  line-height: 1.5;
+  margin: 0.15rem 0;
+}
 
-/* Code blocks */
-pre code { font-size: 0.78rem !important; font-family: ui-monospace, "SF Mono", Menlo, monospace !important; }
+/* Code blocks — modern monospace */
+pre, code { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace !important; }
+pre code { font-size: 0.78rem !important; }
 
-/* Dividers */
-hr { margin: 0.75rem 0 !important; border: none !important; border-top: 1px solid var(--border) !important; }
+/* Dividers — softer, more breathing room */
+hr {
+  margin: 1.5rem 0 !important;
+  border: none !important;
+  border-top: 1px solid var(--border-soft) !important;
+}
 
-/* Position tag */
+/* Position tag — slightly more refined */
 .tag {
   display: inline-block;
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 0.65rem;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 0.66rem;
   font-weight: 700;
   letter-spacing: 0.04em;
-  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
   vertical-align: middle;
+  line-height: 1.3;
 }
 .tag-qb { background: #2563eb; color: white; }
 .tag-rb { background: #059669; color: white; }
@@ -169,37 +330,213 @@ hr { margin: 0.75rem 0 !important; border: none !important; border-top: 1px soli
 .tag-te { background: #d97706; color: white; }
 .tag-flat { background: var(--bg-soft); color: var(--ink-2); border: 1px solid var(--border); }
 
-/* Section header row with right-aligned meta */
+/* Section header — title + right-aligned meta on the same baseline */
 .sec-head {
-  display: flex; justify-content: space-between; align-items: baseline;
-  margin: 1rem 0 0.35rem 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 1.75rem 0 0.5rem 0;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border-soft);
 }
 .sec-head h2 { margin: 0 !important; }
-.sec-head .meta { color: var(--muted); font-size: 0.72rem; }
+.sec-head .meta {
+  color: var(--muted);
+  font-size: 0.73rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
 
-/* Verdict banner */
+/* Card wrapper — opt-in subtle elevation for grouped content */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  margin-bottom: 1rem;
+  box-shadow: var(--shadow-sm);
+}
+
+/* Verdict banner — semantic color, tasteful */
 .verdict {
   border-left: 4px solid var(--accent);
   background: var(--bg-soft);
-  padding: 0.6rem 0.9rem;
-  margin: 0.5rem 0 1rem 0;
-  border-radius: 0 3px 3px 0;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0 1.25rem 0;
+  border-radius: 0 6px 6px 0;
 }
-.verdict .label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 700; }
-.verdict .text { font-size: 1rem; font-weight: 700; color: var(--ink); margin-top: 2px; }
-.verdict .sub  { font-size: 0.75rem; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
-.verdict.send   { border-left-color: var(--good); }
+.verdict .label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  font-weight: 700;
+}
+.verdict .text {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--ink);
+  margin-top: 3px;
+  letter-spacing: -0.005em;
+}
+.verdict .sub {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.verdict.send   { border-left-color: var(--good); background: var(--good-soft); }
 .verdict.send  .text { color: var(--good); }
-.verdict.offer  { border-left-color: var(--warn); }
+.verdict.offer  { border-left-color: var(--warn); background: var(--warn-soft); }
 .verdict.offer .text { color: var(--warn); }
-.verdict.pass   { border-left-color: var(--bad); }
+.verdict.pass   { border-left-color: var(--bad); background: var(--bad-soft); }
 .verdict.pass  .text { color: var(--bad); }
 
+/* Status pill — for stance badges, etc. */
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: var(--bg-soft);
+  color: var(--ink-3);
+  border: 1px solid var(--border-soft);
+}
+.pill-good { background: var(--good-soft); color: #047857; border-color: transparent; }
+.pill-warn { background: var(--warn-soft); color: #b45309; border-color: transparent; }
+.pill-bad  { background: var(--bad-soft);  color: #b91c1c; border-color: transparent; }
+
 /* Plain "label : value" inline rows */
-.kv { font-size: 0.78rem; color: var(--ink-2); margin: 0.15rem 0; }
-.kv span.k { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.62rem; margin-right: 8px; }
+.kv {
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  margin: 0.15rem 0;
+  line-height: 1.5;
+}
+.kv span.k {
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.62rem;
+  margin-right: 10px;
+}
+
+/* Expander — softer */
+.streamlit-expanderHeader, [data-testid="stExpander"] summary {
+  font-size: 0.84rem !important;
+  font-weight: 550 !important;
+  color: var(--ink-2) !important;
+}
+
+/* Anchor links inline */
+a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--muted-3); text-underline-offset: 2px; }
+a:hover { text-decoration-color: var(--ink-2); }
+
+/* ---- Robinhood-style row card (used by Ranks drill-down) ------------------ */
+.rh-row {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 0.7rem 1rem;
+  margin-bottom: 0.45rem;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 140ms ease, transform 140ms ease, border-color 140ms ease;
+}
+.rh-row:hover { box-shadow: var(--shadow-md); border-color: var(--border); }
+.rh-row .name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+}
+.rh-row .meta {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.rh-row .ba {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  font-size: 0.92rem;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+}
+.rh-row .delta-up   { color: var(--good); font-weight: 600; }
+.rh-row .delta-down { color: var(--bad);  font-weight: 600; }
+
+/* ---- Stat grid (used in player drill-down) ------------------------------ */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.6rem; margin: 0.7rem 0; }
+.stat-cell {
+  background: var(--bg-soft);
+  border-radius: 8px;
+  padding: 0.55rem 0.75rem;
+}
+.stat-cell .k { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.09em; font-weight: 600; }
+.stat-cell .v { font-size: 1.05rem; color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+/* ---- Theme-switch chip ------------------------------------------------- */
+.theme-hint { font-size: 0.7rem; color: var(--muted); margin: 0.2rem 0 0.6rem 0; }
 </style>
 """, unsafe_allow_html=True)
+
+# ---- DARK THEME OVERRIDES (Robinhood-Night) ------------------------------
+# Layered ON TOP of the base sheet. Only re-declares the CSS variables —
+# every component that uses var(--*) automatically picks up the new values.
+if st.session_state.get("theme") == "Dark":
+    st.markdown("""
+    <style>
+    :root {
+      --bg-page:     #0b0e14;
+      --bg-soft:     #11151d;
+      --bg-card:     #141923;
+      --bg-sidebar:  #0e121a;
+      --bg-elevated: #1a2030;
+      --border:      #232a38;
+      --border-soft: #1b2230;
+      --ring:        rgba(34, 197, 94, 0.18);
+      --shadow-sm:   0 1px 2px 0 rgba(0, 0, 0, 0.4);
+      --shadow-md:   0 4px 14px -4px rgba(0, 0, 0, 0.55), 0 2px 6px -3px rgba(0, 0, 0, 0.4);
+      --shadow-lg:   0 12px 32px -8px rgba(0, 0, 0, 0.7);
+      --ink:         #e8eef7;
+      --ink-2:       #c3cad6;
+      --ink-3:       #9aa3b2;
+      --muted:       #76808f;
+      --muted-2:     #5b6473;
+      --muted-3:     #353c47;
+      --accent:      #22c55e;
+      --good:        #22c55e;
+      --good-bright: #4ade80;
+      --good-soft:   rgba(34, 197, 94, 0.14);
+      --warn:        #f59e0b;
+      --warn-soft:   rgba(245, 158, 11, 0.14);
+      --bad:         #ef4444;
+      --bad-soft:    rgba(239, 68, 68, 0.14);
+    }
+    /* Stronger anchor for the dark canvas so Streamlit's white toolbar/etc disappear */
+    [data-testid="stAppViewContainer"], .main, .stApp { background: var(--bg-page) !important; }
+    [data-testid="stSidebar"] { background: var(--bg-sidebar) !important; }
+    /* Match dataframes to the dark canvas */
+    [data-testid="stDataFrame"] { background: var(--bg-card) !important; }
+    /* Active tab uses neon green underline for the Robinhood-Night feel */
+    .stTabs [aria-selected="true"] { border-bottom-color: var(--accent) !important; color: var(--ink) !important; }
+    /* Inputs need explicit dark backgrounds */
+    [data-testid="stTextInput"] input,
+    [data-testid="stNumberInput"] input,
+    [data-baseweb="select"] > div,
+    [data-baseweb="input"] input {
+      background: var(--bg-card) !important;
+      color: var(--ink) !important;
+    }
+    .stButton button { background: var(--bg-card) !important; color: var(--ink-2) !important; }
+    .stButton button:hover { background: var(--bg-elevated) !important; }
+    pre, code { color: var(--ink-2) !important; }
+    pre { background: var(--bg-soft) !important; border: 1px solid var(--border-soft) !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
 REPO_ROOT = Path(__file__).parent
 DATA_DIR = REPO_ROOT / "data"
@@ -300,6 +637,18 @@ def cached_player_index(_players: dict, _dp: DataLayer) -> PlayerIndex:
 with st.sidebar:
     st.markdown("<h1 style='margin-bottom:0'>Sleeper Cell</h1>", unsafe_allow_html=True)
     st.caption("Live dynasty draft intelligence")
+
+    # Theme toggle — at the very top so users see it before anything else.
+    # The radio's `key=` binds it to session_state["theme"] directly, so flipping
+    # the radio automatically reruns the script (Streamlit default) and the
+    # theme-override CSS block downstream picks up the new value.
+    st.radio(
+        "Appearance",
+        ["Light", "Dark"],
+        horizontal=True,
+        key="theme",
+        help="Light = Robinhood-Day (white canvas, slate ink). Dark = Robinhood-Night (near-black, neon green accents).",
+    )
 
     default_league = st.secrets.get("sleeper", {}).get("league_id") if hasattr(st, "secrets") else None
     default_draft = st.secrets.get("sleeper", {}).get("draft_id") if hasattr(st, "secrets") else None
@@ -545,17 +894,54 @@ with kpi_cols[3]:
 
 # --------------------------------------------------------------- Tabs
 
-tab_board, tab_best, tab_team, tab_tiers, tab_trade, tab_explain = st.tabs([
-    "Draft Board", "Best Available", "My Team", "Tier Alerts", "Trade Targets", "Why?",
+# Robinhood-style IA: Home (draft snapshot) · Ranks (every player + drill-down) ·
+# Trades (acquire / find / build / history) · League (your team + partners) · Why? (transparency)
+tab_home, tab_ranks, tab_trades, tab_league, tab_explain = st.tabs([
+    "Home", "Ranks", "Trades", "League", "Why?",
 ])
+# Backwards-compat aliases so the existing section bodies keep working unchanged
+tab_board = tab_home
+tab_best = tab_ranks
+tab_tiers = tab_ranks   # Tier alerts now live inside the Ranks tab
+tab_team = tab_league   # My team folds into the League tab
+tab_trade = tab_trades
 
 
 # ------------------------------ Tab: Draft Board ------------------------------
 
 with tab_board:
+    # ----- Home hero: your team at a glance (Robinhood-style "portfolio" header) -----
+    made_n = len([sp for sp in state.schedule if sp.made])
+    total_n = len(state.schedule)
+    my_upcoming = [sp for sp in state.schedule if not sp.made and sp.owner_roster_id == my_roster_id]
+    next_pick = my_upcoming[0] if my_upcoming else None
+    on_clock = next((sp for sp in state.schedule if not sp.made), None)
+    on_clock_label = (
+        f"R{on_clock.round}.{on_clock.slot_pos} · {roster_name(on_clock.owner_roster_id)}"
+        if on_clock else "—"
+    )
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Draft progress", f"{made_n}/{total_n}", help="Picks made vs. total picks across all rounds.")
+    h2.metric(
+        "On the clock",
+        on_clock_label,
+        help="The current pick — who picks next and at what slot.",
+    )
+    h3.metric(
+        "Your next pick",
+        f"R{next_pick.round}.{next_pick.slot_pos}" if next_pick else "—",
+        delta=f"#{next_pick.pick_no} overall" if next_pick else None,
+        help="Your next upcoming startup pick (pick number and round.slot).",
+    )
+    h4.metric(
+        "Picks remaining (you)",
+        len(my_upcoming),
+        help="How many of your own startup picks are still unmade.",
+    )
+
     # ----- Recent picks (clean table) -----
     st.markdown('<div class="sec-head"><h2>Recent picks</h2>'
-                f'<div class="meta">{len([sp for sp in state.schedule if sp.made])} of {len(state.schedule)} made</div></div>',
+                f'<div class="meta">{made_n} of {total_n} made</div></div>',
                 unsafe_allow_html=True)
     recent = sorted([sp for sp in state.schedule if sp.made], key=lambda x: -x.pick_no)[:18]
     if recent:
@@ -806,6 +1192,110 @@ with tab_best:
     st.caption("**Dynamic VBD** = dynasty_value − value of the player likely available at your next pick. "
                "Positive = take now. Negative = you can probably wait at that position.")
 
+    # ---------- PLAYER DRILL-DOWN (Robinhood-style detail card) ----------
+    # Pick any player from the filtered list above and see the full breakdown:
+    # scoring components, dynasty trajectory, where they'd land in the market,
+    # and the closest comparable peers at their position.
+    st.markdown('<div class="sec-head"><h2>Player detail</h2>'
+                '<div class="meta">drill into the math behind any player</div></div>',
+                unsafe_allow_html=True)
+
+    detail_options = [(v.player_id, f"{v.name} · {v.position}{v.position_rank} · {v.team or 'FA'}") for v in filtered]
+    if not detail_options:
+        st.info("No players match the filters above.")
+    else:
+        # Default to the top-ranked filtered player so the panel never starts empty.
+        sel_pid = st.selectbox(
+            "Select player",
+            detail_options,
+            format_func=lambda x: x[1],
+            key="ranks_detail_pick",
+            label_visibility="collapsed",
+        )[0]
+        v = next((x for x in valued_all if x.player_id == sel_pid), None)
+        proj = projections.get(sel_pid)
+        if v is not None:
+            # ----- Header card -----
+            adp = consensus_idx_local.get(v.player_id)
+            adp_disp = f"{adp:.1f}" if (adp is not None and adp < 500) else "—"
+            comm_raw = (
+                v.adjusted_ktc or v.ktc_value or v.dp_value_2qb or v.dp_value_1qb or 0
+            )
+            st.markdown(
+                f"""
+                <div class="rh-row" style="padding: 1rem 1.2rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem;">
+                    <div>
+                      <div style="font-size:1.25rem; font-weight:700; color:var(--ink); letter-spacing:-0.01em;">
+                        {pos_chip(v.position)} &nbsp; {v.name}
+                      </div>
+                      <div class="meta" style="margin-top:4px;">
+                        {v.team or 'FA'} · age {v.age or '—'} · rank #{v.overall_rank} overall ·
+                        {v.position}{v.position_rank}
+                      </div>
+                    </div>
+                    <div style="text-align:right;">
+                      <div style="font-size:0.62rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.09em; font-weight:600;">Dynasty (your league)</div>
+                      <div class="ba" style="font-size:1.65rem;">{fmt_ba(v.pct_dynasty)}</div>
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # ----- Stat grid -----
+            stat_cells = [
+                ("Season pts", f"{round(v.season_points)}"),
+                ("Dynasty raw", f"{round(v.dynasty_value)}"),
+                ("VBD", fmt_ba(v.pct_vbd)),
+                ("Community", fmt_ba(v.pct_community) if v.pct_community is not None else "—"),
+                ("Adj community", fmt_ba(v.pct_adj_community) if v.pct_adj_community is not None else "—"),
+                ("Fit ×", f"{v.league_fit:.2f}" if v.league_fit else "—"),
+                ("Market value", f"{round(comm_raw):,}" if comm_raw else "—"),
+                ("Consensus ADP", adp_disp),
+            ]
+            grid_html = "<div class='stat-grid'>" + "".join(
+                f"<div class='stat-cell'><div class='k'>{k}</div><div class='v'>{val}</div></div>"
+                for k, val in stat_cells
+            ) + "</div>"
+            st.markdown(grid_html, unsafe_allow_html=True)
+
+            # ----- Scoring components (what built the season points) -----
+            if proj:
+                comps = explain_scoring_components(proj.stats, cfg, top_n=8)
+                if comps:
+                    st.markdown("##### Scoring breakdown")
+                    comp_rows = [{"Component": label, "Points": round(pts, 1)} for label, pts in comps]
+                    st.dataframe(
+                        comp_rows, hide_index=True, width="stretch",
+                        height=min(360, 50 + 36 * len(comp_rows)),
+                    )
+
+            # ----- Comparables — same position, nearest dynasty value -----
+            peers = sorted(
+                [x for x in valued_all if x.position == v.position and x.player_id != v.player_id],
+                key=lambda x: abs(x.dynasty_value - v.dynasty_value),
+            )[:6]
+            if peers:
+                st.markdown("##### Closest comparables at position")
+                peer_rows = [
+                    {
+                        "Rank": p.overall_rank,
+                        "Player": p.name,
+                        "Team": p.team or "FA",
+                        "Age": p.age or "—",
+                        "Dyn": fmt_ba(p.pct_dynasty),
+                        "Dyn (raw)": round(p.dynasty_value),
+                        "Δ vs " + v.name.split()[-1]: round(p.dynasty_value - v.dynasty_value),
+                    }
+                    for p in peers
+                ]
+                st.dataframe(
+                    peer_rows, hide_index=True, width="stretch",
+                    height=min(280, 50 + 36 * len(peer_rows)),
+                )
+
     # ---------- BUY-LOW ----------
     st.markdown('<div class="sec-head"><h2>Buy-low watchlist</h2>'
                 '<div class="meta">your rank ≪ consensus ADP — they\'ll let these slide</div></div>',
@@ -1031,14 +1521,185 @@ with tab_trade:
 
     needs_all = league_needs(state, projections)
 
-    # ---------- RECOMMENDED OFFERS ----------
-    st.markdown('<div class="sec-head"><h2>Recommended offers</h2>'
+    # Parse transaction history for trade-activity weighting (used below + by recommender)
+    player_name_fn = lambda pid: (projections[pid].name if pid in projections else f"player {pid}")
+    trades_history = parse_trades(transactions_raw, roster_name_fn=roster_name)
+    activity_counts = activity_per_roster(trades_history)
+
+    # ---------- ACQUISITION PLANNER ----------
+    st.markdown('<div class="sec-head"><h2>Acquisition planner</h2>'
+                '<div class="meta">pick what you want — see what it costs</div></div>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Reverse trade finder. Tell it which player(s) and/or pick(s) you want from a "
+        "specific partner; it returns the cheapest viable packages you can offer to "
+        "get them. Ranked by YOUR value gain (best for you first), filtered to trades "
+        "the partner would plausibly accept."
+    )
+
+    if not pick_model:
+        st.info("DynastyProcess values not loaded — acquisition planner needs the data layer to be online.")
+    else:
+        # ---- Partner selection ----
+        partner_rids_all = sorted(set(state.slot_to_roster.values()) - {my_roster_id})
+        partner_labels = [roster_name(rid) for rid in partner_rids_all]
+        ap_col_partner, ap_col_results = st.columns([1, 2])
+        with ap_col_partner:
+            target_partner_label = st.selectbox(
+                "Partner",
+                partner_labels,
+                key="ap_partner",
+                help="Which manager you want to acquire from.",
+            )
+            target_partner_rid = partner_rids_all[partner_labels.index(target_partner_label)]
+
+            # Their drafted players
+            their_picks_made = [p for p in state.picks if int(p.get("roster_id") or 0) == target_partner_rid]
+            their_player_options = []
+            for pk in their_picks_made:
+                pid = str(pk.get("player_id") or "")
+                if pid in projections:
+                    proj = projections[pid]
+                    their_player_options.append((pid, f"{proj.position} {proj.name} ({proj.team or 'FA'})"))
+            target_player_ids = st.multiselect(
+                "Their drafted players you want",
+                their_player_options,
+                format_func=lambda x: x[1],
+                key="ap_target_players",
+            )
+
+            # Their unmade startup picks
+            their_unmade_sps = sorted(
+                [sp for sp in state.schedule if not sp.made and sp.owner_roster_id == target_partner_rid],
+                key=lambda sp: sp.pick_no,
+            )[:8]
+            sp_options = [(sp.pick_no, f"pick {sp.pick_no} (R{sp.round}.{sp.slot_pos})") for sp in their_unmade_sps]
+            target_startup_picks = st.multiselect(
+                "Their upcoming startup picks",
+                sp_options,
+                format_func=lambda x: x[1],
+                key="ap_target_sps",
+            )
+
+            # Their future rookie picks
+            their_future_picks: list[tuple[str, int, int]] = []
+            future_pick_options = []
+            for season in ("2027", "2028"):
+                for p in state.future_pick_inventory(season).get(target_partner_rid, []):
+                    key = (season, p["round"], p["orig_roster_id"])
+                    via = "" if p["orig_roster_id"] == target_partner_rid else f" (via {roster_name(p['orig_roster_id'])})"
+                    future_pick_options.append((key, f"{season} R{p['round']}{via}"))
+            target_future_picks = st.multiselect(
+                "Their future rookie picks",
+                future_pick_options,
+                format_func=lambda x: x[1],
+                key="ap_target_futures",
+            )
+
+            max_give = st.slider(
+                "Max assets per offer",
+                min_value=1, max_value=5, value=4,
+                key="ap_max_give",
+                help="Largest package size to consider on YOUR side. Recent trades in your "
+                     "league have run as deep as 4-for-2. Bump higher for big trade-up packages.",
+            )
+
+        # ---- Run planner + render results ----
+        with ap_col_results:
+            if not (target_player_ids or target_startup_picks or target_future_picks):
+                st.info(
+                    "Pick at least one asset on the left, then results will appear here. "
+                    "You can mix players, upcoming startup picks, and future rookie picks in one ask."
+                )
+            else:
+                target_player_id_list = [pid for pid, _ in target_player_ids]
+                target_sp_list = [pn for pn, _ in target_startup_picks]
+                target_fp_list = [tup for tup, _ in target_future_picks]
+
+                options = plan_acquisition(
+                    state=state, valued_all=valued_all, projections=projections,
+                    pick_model=pick_model, cfg=cfg,
+                    my_roster_id=my_roster_id,
+                    partner_rid=target_partner_rid,
+                    target_player_ids=target_player_id_list,
+                    target_picks=target_fp_list,
+                    target_startup_picks=target_sp_list,
+                    roster_name_fn=roster_name,
+                    max_combo_size=int(max_give),
+                    max_results=10,
+                )
+
+                if not options:
+                    st.warning(
+                        "No viable packages found. Either you don't have enough trade-able "
+                        "assets to satisfy this ask, or the partner would reject every "
+                        "combination. Try selecting fewer / less-premium targets."
+                    )
+                else:
+                    st.caption(f"Showing {len(options)} viable package{'s' if len(options) > 1 else ''}, "
+                               "cheapest to YOU first.")
+                    for i, opt in enumerate(options, start=1):
+                        v_class = "send" if opt.eval.combined in ("SEND IT", "SEND") else (
+                            "offer" if opt.eval.combined.startswith("OFFER") or "FAIR" in opt.eval.combined else "pass"
+                        )
+                        head = (
+                            f"#{i}  ·  Offer: {opt.summary_line}  ·  "
+                            f"You {opt.eval.tw_delta:+.0f}  ·  {opt.eval.combined}"
+                        )
+                        with st.expander(head, expanded=(i == 1)):
+                            kc1, kc2, kc3 = st.columns(3)
+                            kc1.metric("Your gain", f"{opt.eval.tw_delta:+.0f}",
+                                       help="Trade delta in YOUR league-adjusted value.")
+                            kc2.metric("Market gain", f"{opt.eval.consensus_delta_for_them:+.0f}",
+                                       help="What the partner sees on their side.")
+                            kc3.metric("Verdict", opt.eval.combined.split("(")[0].strip())
+
+                            cg, cr = st.columns(2)
+                            with cg:
+                                st.markdown("**You'd give**")
+                                for a in opt.give:
+                                    if isinstance(a, PlayerAsset):
+                                        st.markdown(
+                                            f"&middot; {pos_chip(a.position)} **{a.name}** "
+                                            f"<span style='color:var(--muted);font-size:0.72rem'>"
+                                            f"You {a.tw_value:.0f} · Market {a.consensus_value:.0f}</span>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    else:
+                                        st.markdown(
+                                            f"&middot; {a.label} "
+                                            f"<span style='color:var(--muted);font-size:0.72rem'>"
+                                            f"You {a.tw_value:.0f} · Market {a.consensus_value:.0f}</span>",
+                                            unsafe_allow_html=True,
+                                        )
+                            with cr:
+                                st.markdown(f"**You get** (from {target_partner_label})")
+                                for a in opt.get:
+                                    if isinstance(a, PlayerAsset):
+                                        st.markdown(
+                                            f"&middot; {pos_chip(a.position)} **{a.name}** "
+                                            f"<span style='color:var(--muted);font-size:0.72rem'>"
+                                            f"You {a.tw_value:.0f} · Market {a.consensus_value:.0f}</span>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    else:
+                                        st.markdown(
+                                            f"&middot; {a.label} "
+                                            f"<span style='color:var(--muted);font-size:0.72rem'>"
+                                            f"You {a.tw_value:.0f} · Market {a.consensus_value:.0f}</span>",
+                                            unsafe_allow_html=True,
+                                        )
+
+                            msg = build_offer_message(opt.eval, your_handle="you", their_handle=target_partner_label)
+                            st.code(msg, language="text")
+
+    # ---------- TRADE FINDER (auto-generated offers) ----------
+    st.markdown('<div class="sec-head"><h2>Trade Finder</h2>'
                 '<div class="meta">auto-generated · mutual-win scored</div></div>',
                 unsafe_allow_html=True)
     st.caption(
         "Scans every partner and every plausible asset combination. Ranks by mutual-win "
-        "— your value gain × the market-value gain on their side. Only surfaces offers where "
-        "you net positive in your model AND the partner is likely to accept or counter."
+        "— your value gain × the market-value gain on their side."
     )
     with st.expander("What do 'Your value' and 'Market value' mean?", expanded=False):
         st.markdown("""
@@ -1063,10 +1724,48 @@ GAIN in Market value, it's a true mutual-win — they'll accept and you'll come 
 ahead by your math. That's the trade you send.
 """)
 
-    # Parse transaction history for trade-activity weighting
-    player_name_fn = lambda pid: (projections[pid].name if pid in projections else f"player {pid}")
-    trades_history = parse_trades(transactions_raw, roster_name_fn=roster_name)
-    activity_counts = activity_per_roster(trades_history)
+    # --- Recommender controls: search depth + partner filter + show-more ---
+    ctrl_depth, ctrl_partner, ctrl_more = st.columns([2, 2, 1])
+    with ctrl_depth:
+        depth_choice = st.radio(
+            "Search depth",
+            ["Strict", "Normal", "Aggressive"],
+            horizontal=True,
+            help="Strict = high-confidence mutual-win only · Normal = wider net · "
+                 "Aggressive = include marginal/creative packages. Higher depth = "
+                 "more variety in the offer list AND more noise.",
+        )
+    depth_key = depth_choice.lower()
+    depth_cfg = SEARCH_DEPTHS[depth_key]
+
+    # Partner filter
+    partner_rids = sorted(set(state.slot_to_roster.values()) - {my_roster_id})
+    partner_labels = ["All partners"] + [roster_name(rid) for rid in partner_rids]
+    with ctrl_partner:
+        partner_pick = st.selectbox(
+            "Force partner",
+            partner_labels,
+            help="Restrict the search to one specific partner. Useful when you want "
+                 "to deeply explore offers with a single team.",
+        )
+    partner_filter_rid = None
+    if partner_pick != "All partners":
+        for rid in partner_rids:
+            if roster_name(rid) == partner_pick:
+                partner_filter_rid = rid
+                break
+
+    # Show-more state: each depth has its own session counter so switching depth resets.
+    sm_key = f"_show_more_offset_{depth_key}_{partner_filter_rid or 'all'}"
+    if sm_key not in st.session_state:
+        st.session_state[sm_key] = 0
+    extra = st.session_state[sm_key]
+    effective_max = int(depth_cfg["max_total"]) + extra
+
+    with ctrl_more:
+        if st.button("Show more candidates", help=f"Reveal {int(depth_cfg['max_total'])} more offers below the current top list."):
+            st.session_state[sm_key] = extra + int(depth_cfg["max_total"])
+            st.rerun()
 
     if pick_model:
         offers = recommend_offers(
@@ -1074,6 +1773,11 @@ ahead by your math. That's the trade you send.
             pick_model=pick_model, cfg=cfg, my_roster_id=my_roster_id,
             roster_name_fn=roster_name,
             activity_per_roster=activity_counts,
+            min_tw_gain=float(depth_cfg["min_tw_gain"]),
+            max_per_partner=int(depth_cfg["max_per_partner"]),
+            max_total=effective_max,
+            top_their_players=int(depth_cfg["top_their_players"]),
+            partner_filter=partner_filter_rid,
         )
     else:
         offers = []
@@ -1081,23 +1785,7 @@ ahead by your math. That's the trade you send.
     if not offers:
         st.info("No high-confidence offers right now. Try again after the next few picks.")
     else:
-        # Compact summary table first
-        offer_table = []
-        for i, o in enumerate(offers, start=1):
-            offer_table.append({
-                "#": i,
-                "Partner": o.partner_name,
-                "You give": ", ".join((a.name if isinstance(a, PlayerAsset) else a.label) for a in o.give),
-                "You get":  ", ".join((a.name if isinstance(a, PlayerAsset) else a.label) for a in o.get),
-                "Your gain": round(o.eval.tw_delta),
-                "Market gain (theirs)": round(o.eval.consensus_delta_for_them),
-                "Verdict": o.eval.combined,
-            })
-        st.dataframe(offer_table, hide_index=True, width="stretch",
-                     height=min(540, 50 + 36 * len(offer_table)))
-
-        # Detailed expandable cards for each offer
-        st.markdown('<h5>Trade Finder</h5>', unsafe_allow_html=True)
+        st.caption(f"{len(offers)} candidate offer{'s' if len(offers) > 1 else ''} — expand any row to see detail and copy message.")
         for i, o in enumerate(offers, start=1):
             verdict_class = "send" if o.eval.combined in ("SEND IT", "SEND") else (
                 "offer" if o.eval.combined.startswith("OFFER") or "FAIR" in o.eval.combined else "pass"
@@ -1334,17 +2022,60 @@ ahead by your math. That's the trade you send.
 
     # ---------- LEAGUE TRADE HISTORY ----------
     st.markdown('<div class="sec-head"><h2>League trade history</h2>'
-                f'<div class="meta">{len(trades_history)} completed trades</div></div>',
+                f'<div class="meta">{len(trades_history)} completed trades · graded retroactively</div></div>',
                 unsafe_allow_html=True)
     st.caption(
-        "Every completed trade in this league — startup picks, future picks, "
-        "players, FAAB. The recommender uses these counts to weight which "
-        "partners are more likely to deal again."
+        "Every completed trade in this league with retroactive grades for each side. "
+        "Grade scale uses community values: A+ = +1500 community gain · A = +800 · "
+        "B = +250 · C = ±250 push · D = −250 to −800 · F = worse than −1500. "
+        "Picks are valued by the drafted player when the pick has been used, by pick-model "
+        "defaults otherwise."
     )
     if trades_history:
-        history_rows = to_normalized_rows(trades_history, roster_name, player_name_fn=player_name_fn)
-        st.dataframe(history_rows, hide_index=True, width="stretch",
-                     height=min(540, 50 + 36 * min(len(history_rows), 15)))
+        trade_grades = grade_trades(
+            trades_history, valued=valued_all, pick_model=pick_model, state=state,
+        )
+        history_rows = to_graded_rows(
+            trades_history, roster_name, trade_grades,
+            player_name_fn=player_name_fn,
+        )
+        st.dataframe(
+            history_rows, hide_index=True, width="stretch",
+            height=min(540, 50 + 36 * min(len(history_rows), 15)),
+            column_config={
+                "When": st.column_config.TextColumn("When", width="small"),
+                "A grade": st.column_config.TextColumn(
+                    "A grade", help="Side A's grade. A+/A = clear win, B = small win, "
+                                    "C = roughly even, D/F = loss in community value.",
+                    width="small",
+                ),
+                "A Δ": st.column_config.NumberColumn(
+                    "A Δ", help="Side A's net community-value delta (received − given). "
+                                "Positive = won value.",
+                    format="%+d", width="small",
+                ),
+                "B grade": st.column_config.TextColumn(
+                    "B grade", help="Side B's grade — mirror of A's.", width="small",
+                ),
+                "B Δ": st.column_config.NumberColumn(
+                    "B Δ", help="Side B's net community-value delta.",
+                    format="%+d", width="small",
+                ),
+            },
+        )
+
+        # Quick distribution summary so the user gets a feel for how grades pan out
+        from collections import Counter
+        all_grades = Counter()
+        for sides in trade_grades.values():
+            for g in sides.values():
+                all_grades[g.grade] += 1
+        if all_grades:
+            grade_order = ["A+", "A", "B", "C", "D", "F"]
+            summary = "  ·  ".join(
+                f"{g}: {all_grades.get(g, 0)}" for g in grade_order if all_grades.get(g, 0)
+            )
+            st.caption(f"Distribution across all sides: {summary}")
     else:
         st.info("No completed trades found yet in this league's transaction log.")
 

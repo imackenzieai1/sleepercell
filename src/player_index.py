@@ -84,11 +84,22 @@ class PlayerIndex:
         values_df = self.dp.values()
 
         # Join cross-walk -> values on fp_id <-> fantasypros_id.
+        # CRITICAL: values.csv mixes player rows and PICK rows (e.g., "2026 Pick 1.01"
+        # with pos='PICK' and a NaN fp_id). Many ids_df rows ALSO have NaN
+        # fantasypros_id (anyone without FantasyPros coverage). Pandas' Int64 merge
+        # treats pd.NA == pd.NA as a match, so without filtering, every
+        # FP-less player gets joined to the FIRST PICK row — and inherits its
+        # value_2qb (e.g., 8027 from "2026 Pick 1.01"). This was the source of
+        # the "every unranked player is worth 8027" / "pick 27 == pick 48 == 8027"
+        # bug. Drop PICK rows AND any NaN-fp_id rows before merging.
         ids_df["fantasypros_id"] = pd.to_numeric(ids_df["fantasypros_id"], errors="coerce").astype("Int64")
         values_df["fp_id"] = pd.to_numeric(values_df.get("fp_id"), errors="coerce").astype("Int64")
+        values_players = values_df[
+            (values_df["fp_id"].notna()) & (values_df.get("pos") != "PICK")
+        ]
 
         merged = ids_df.merge(
-            values_df[["fp_id", "value_1qb", "value_2qb", "ecr_1qb", "ecr_2qb"]],
+            values_players[["fp_id", "value_1qb", "value_2qb", "ecr_1qb", "ecr_2qb"]],
             left_on="fantasypros_id",
             right_on="fp_id",
             how="left",

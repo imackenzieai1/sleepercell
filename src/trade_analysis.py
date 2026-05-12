@@ -180,20 +180,24 @@ def player_asset(player_id: str, valued: list[ValuedPlayer]) -> PlayerAsset | No
     `tw_value` (our model side) = dynasty_value — per-stat projection × YOUR
     league's scoring × age curve × strategy weights.
 
-    `consensus_value` (market side) prefers community values in this order:
-        1. ktc_value (from FantasyCalc fetch or KTC CSV) — SF dynasty consensus
-        2. dp_value_2qb (DynastyProcess SF) — fallback if no community overlay
-        3. dp_value_1qb — last resort
+    `consensus_value` (market side) prefers values in this order:
+        1. adjusted_ktc — community value × league-fit. This is the cleanest "market
+           in YOUR league" estimate — KTC/FantasyCalc consensus re-tilted to reflect
+           your specific scoring premiums (e.g., QBs lift in SF+TEP+6pt-TD leagues).
+        2. ktc_value — raw community value (KTC / FantasyCalc) if no fit was computed.
+        3. dp_value_2qb (DynastyProcess SF) — fallback if no community overlay.
+        4. dp_value_1qb — last resort.
 
-    When the user has loaded a Community overlay, the trade math automatically
-    uses it for the "market" side. The two columns in the UI ("Your value" and
-    "Market value") are now in self-consistent units throughout the calculator.
+    When you've loaded a Community overlay, every trade-math call automatically
+    uses the league-adjusted version. The "Market value" in the UI reflects what
+    the assets are worth in YOUR league's market, not in a generic SF dynasty.
     """
     v = next((x for x in valued if x.player_id == player_id), None)
     if v is None:
         return None
     market_value = float(
-        v.ktc_value
+        v.adjusted_ktc
+        or v.ktc_value
         or v.dp_value_2qb
         or v.dp_value_1qb
         or 0.0

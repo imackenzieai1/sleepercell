@@ -1,0 +1,17 @@
+# Streamlit theme — harmonizes the framework's built-in chrome with our custom CSS.
+# Keep this minimal: the heavy lift happens in the <style> block at the top of app.py.
+
+[theme]
+base = "light"
+primaryColor = "#0f172a"            # slate-900 — used for active tab underline, focused inputs
+backgroundColor = "#ffffff"         # main canvas
+secondaryBackgroundColor = "#f8fafc" # sidebar + metric tile background
+textColor = "#0f172a"               # primary ink
+font = "sans-serif"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = "full"           # keep tracebacks visible during dev/deploy
+toolbarMode = "minimal"             # hides the burger menu in the top-right

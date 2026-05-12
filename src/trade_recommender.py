@@ -80,10 +80,33 @@ from .valuation import ValuedPlayer
 
 # Tuning knobs ----------------------------------------------------------------
 MIN_TW_GAIN = 60.0          # minimum TW delta to even consider an offer
-MAX_PER_PARTNER = 3          # how many offers to keep per partner (bumped from 2 for mega patterns)
-MAX_TOTAL_OFFERS = 15        # global cap (bumped from 12)
+MAX_PER_PARTNER = 3          # how many offers to keep per partner
+MAX_TOTAL_OFFERS = 15        # global cap
 TOP_THEIR_PLAYERS = 6        # how deep into their roster to consider acquiring
 TOP_SELL_TARGETS = 3         # which of my drafted players are sell-candidates
+
+# Search-depth presets — let the UI toggle "how many candidates do we even consider".
+# Lower min_tw_gain + higher top_their_players = more variety, more noise.
+SEARCH_DEPTHS: dict[str, dict[str, float]] = {
+    "strict": {
+        "min_tw_gain": 60.0,
+        "max_per_partner": 3,
+        "max_total": 15,
+        "top_their_players": 6,
+    },
+    "normal": {
+        "min_tw_gain": 30.0,
+        "max_per_partner": 4,
+        "max_total": 25,
+        "top_their_players": 8,
+    },
+    "aggressive": {
+        "min_tw_gain": 0.0,
+        "max_per_partner": 5,
+        "max_total": 40,
+        "top_their_players": 10,
+    },
+}
 
 
 @dataclass
@@ -98,8 +121,29 @@ class TradeOffer:
     summary_line: str   # short one-line summary for headers
 
 
+@dataclass
+class AcquisitionOption:
+    """One way to acquire the target asset(s) — what to give, and what it costs."""
+    give: list[Asset]
+    get: list[Asset]
+    eval: TradeEval
+    summary_line: str
+
+
 # ---------------------------------------------------------------------------
 # Asset enumeration
+
+
+def _market_value(v: ValuedPlayer) -> float:
+    """Best-available community/market value for a player.
+    Same chain used everywhere in trade math (adjusted_ktc → ktc → DP)."""
+    return float(
+        getattr(v, "adjusted_ktc", None)
+        or getattr(v, "ktc_value", None)
+        or getattr(v, "dp_value_2qb", None)
+        or getattr(v, "dp_value_1qb", None)
+        or 0.0
+    )
 
 
 def _value_unmade_pick(
@@ -111,20 +155,27 @@ def _value_unmade_pick(
 ) -> tuple[float, float]:
     """Approximate (tw_value, consensus_value) of an unmade startup-draft pick.
 
-    Realistic model: rank undrafted players by consensus ADP ascending. The player
-    you'll actually land at pick N is roughly the (N - picks_already_made)-th best
-    undrafted player — not "the player closest to ADP N" (the prior approach,
-    which inflated picks by latching onto stragglers with low ADP).
+    **Monotonicity guarantee**: pick N's value is always ≥ pick (N+1)'s value.
+    We achieve this by sorting the undrafted pool by COMMUNITY VALUE descending
+    (highest-market-value player first) and taking the N-th by community value.
+    The prior approach sorted by ADP, then took the player at that ADP rank — but
+    individual players have different (ADP, community-value) profiles, so the
+    resulting pick values could invert (pick 27 worth more than pick 25). This
+    fix anchors the pick's value to its market-rank position in the pool, which
+    is what matters for trade math anyway.
+
+    TW value is taken from the same target player as the community value, so
+    both halves of the returned tuple stay internally consistent.
     """
     undrafted = sorted(
-        [v for v in valued_pool if v.player_id not in drafted_ids],
-        key=lambda v: consensus_idx.get(v.player_id, 9999.0),
+        [v for v in valued_pool if v.player_id not in drafted_ids and _market_value(v) > 0],
+        key=lambda v: -_market_value(v),
     )
     if not undrafted:
         return 0.0, 0.0
     idx = max(0, min(pick_no - picks_already_made - 1, len(undrafted) - 1))
     target = undrafted[idx]
-    return target.dynasty_value, float(target.dp_value_2qb or target.dp_value_1qb or 0.0)
+    return float(target.dynasty_value or 0.0), _market_value(target)
 
 
 def _gather_assets(
@@ -164,8 +215,19 @@ def _gather_assets(
         v = valued_by_id.get(pid)
         if not v:
             continue
-        raw_consensus = float(v.dp_value_2qb or v.dp_value_1qb or 0.0)
-        # Floor: value of the pick they were drafted at
+        # Prefer adjusted-community (community × league-fit) → community → DP fallback.
+        # This makes the recommender's market values consistent with what the user sees
+        # in Best Available, AND reflects league-specific scoring premiums (e.g., elite
+        # volume QBs lift higher in a TEP/6pt-TD/completion-bonus league than raw KTC shows).
+        raw_consensus = float(
+            v.adjusted_ktc
+            or v.ktc_value
+            or v.dp_value_2qb
+            or v.dp_value_1qb
+            or 0.0
+        )
+        # Draft-capital floor: a player drafted at pick N is worth AT LEAST the
+        # community value of pick N, regardless of what the model thinks.
         pno = pick_no_for_player.get(pid)
         floor = pick_no_to_consensus_value.get(pno, 0.0) if pno else 0.0
         effective_consensus = max(raw_consensus, floor)
@@ -250,20 +312,17 @@ def _their_likely_want(their_summary) -> str | None:
     return max(their_summary.needs, key=their_summary.needs.get)
 
 
-def _score_offer(ev: TradeEval) -> float:
+def _score_offer(ev: TradeEval, min_tw_gain: float = MIN_TW_GAIN) -> float:
     """Higher = better. Rewards mutual-win trades; saturates above huge gaps."""
     my_gain = max(0.0, ev.tw_delta)
-    if my_gain < MIN_TW_GAIN:
+    if my_gain < min_tw_gain:
         return 0.0
-    # Reward when partner also "wins" by their model. Their gain is positive when
-    # their consensus_delta_for_them >= 0.
     their_gain = max(0.0, ev.consensus_delta_for_them)
-    # Score: my gain × (1 + sigmoid-like bonus from their gain)
     return my_gain * (1.0 + min(their_gain, 1500.0) / 1000.0)
 
 
-def _is_acceptable(ev: TradeEval) -> bool:
-    if ev.tw_delta < MIN_TW_GAIN:
+def _is_acceptable(ev: TradeEval, min_tw_gain: float = MIN_TW_GAIN) -> bool:
+    if ev.tw_delta < min_tw_gain:
         return False
     return ev.their_response in ("accept", "counter")
 
@@ -330,6 +389,9 @@ def recommend_offers(
     *,
     max_per_partner: int = MAX_PER_PARTNER,
     max_total: int = MAX_TOTAL_OFFERS,
+    min_tw_gain: float = MIN_TW_GAIN,
+    top_their_players: int = TOP_THEIR_PLAYERS,
+    partner_filter: int | None = None,
     roster_name_fn=None,
     activity_per_roster: dict[int, int] | None = None,
 ) -> list[TradeOffer]:
@@ -358,8 +420,14 @@ def recommend_offers(
 
     all_offers: list[TradeOffer] = []
 
+    # Local helpers that respect the min_tw_gain override
+    _acc = lambda ev: _is_acceptable(ev, min_tw_gain)
+    _sco = lambda ev: _score_offer(ev, min_tw_gain)
+
     for partner_rid in sorted(set(state.slot_to_roster.values())):
         if partner_rid == my_roster_id:
+            continue
+        if partner_filter is not None and partner_rid != partner_filter:
             continue
         their_summary = team_summary(state, partner_rid, projections)
         their_players, their_futures, their_unmade = _gather_assets(
@@ -371,7 +439,7 @@ def recommend_offers(
             picks_already_made=picks_already_made,
         )
         # Sort their players by TW desc — we want to acquire their best
-        their_top = sorted(their_players, key=lambda a: -a.tw_value)[:TOP_THEIR_PLAYERS]
+        their_top = sorted(their_players, key=lambda a: -a.tw_value)[:top_their_players]
 
         partner_offers: list[TradeOffer] = []
         # Activity multiplier: more historical trades = more open to dealing
@@ -391,7 +459,7 @@ def recommend_offers(
                     give = [mu1, mu2]
                     get = [tu]
                     ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                    if not _is_acceptable(ev):
+                    if not _acc(ev):
                         continue
                     partner_offers.append(TradeOffer(
                         partner_rid=partner_rid,
@@ -399,7 +467,7 @@ def recommend_offers(
                         give=give, get=get, eval=ev,
                         rationale=_build_rationale(ev, give, get, my_summary, their_summary)
                                   + "; startup trade-up",
-                        score=_score_offer(ev) * activity_mult,
+                        score=_sco(ev) * activity_mult,
                         summary_line=_summary_line(give, get),
                     ))
 
@@ -412,7 +480,7 @@ def recommend_offers(
                     give = [mu]
                     get = [tu1, tu2]
                     ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                    if not _is_acceptable(ev):
+                    if not _acc(ev):
                         continue
                     partner_offers.append(TradeOffer(
                         partner_rid=partner_rid,
@@ -420,7 +488,7 @@ def recommend_offers(
                         give=give, get=get, eval=ev,
                         rationale=_build_rationale(ev, give, get, my_summary, their_summary)
                                   + "; startup trade-down",
-                        score=_score_offer(ev) * activity_mult,
+                        score=_sco(ev) * activity_mult,
                         summary_line=_summary_line(give, get),
                     ))
 
@@ -433,14 +501,14 @@ def recommend_offers(
                         give = [mu1, mu2]
                         get = [tp, tu]
                         ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                        if not _is_acceptable(ev):
+                        if not _acc(ev):
                             continue
                         partner_offers.append(TradeOffer(
                             partner_rid=partner_rid,
                             partner_name=roster_name_fn(partner_rid),
                             give=give, get=get, eval=ev,
                             rationale=_build_rationale(ev, give, get, my_summary, their_summary),
-                            score=_score_offer(ev) * activity_mult,
+                            score=_sco(ev) * activity_mult,
                             summary_line=_summary_line(give, get),
                         ))
 
@@ -454,14 +522,14 @@ def recommend_offers(
         for tp in their_top:
             for mp in my_futures:
                 ev = evaluate_trade(give=[mp], get=[tp], cfg=cfg, my_roster_id=my_roster_id)
-                if not _is_acceptable(ev):
+                if not _acc(ev):
                     continue
                 partner_offers.append(TradeOffer(
                     partner_rid=partner_rid,
                     partner_name=roster_name_fn(partner_rid),
                     give=[mp], get=[tp], eval=ev,
                     rationale=_build_rationale(ev, [mp], [tp], my_summary, their_summary),
-                    score=_score_offer(ev) * activity_mult,
+                    score=_sco(ev) * activity_mult,
                     summary_line=_summary_line([mp], [tp]),
                 ))
 
@@ -474,14 +542,14 @@ def recommend_offers(
                     give = [mp, mu]
                     get = [tp]
                     ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                    if not _is_acceptable(ev):
+                    if not _acc(ev):
                         continue
                     partner_offers.append(TradeOffer(
                         partner_rid=partner_rid,
                         partner_name=roster_name_fn(partner_rid),
                         give=give, get=get, eval=ev,
                         rationale=_build_rationale(ev, give, get, my_summary, their_summary),
-                        score=_score_offer(ev) * activity_mult,
+                        score=_sco(ev) * activity_mult,
                         summary_line=_summary_line(give, get),
                     ))
 
@@ -497,7 +565,7 @@ def recommend_offers(
                             give = [mu1, mu2, mu3]
                             get = [tp, tu]
                             ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                            if not _is_acceptable(ev):
+                            if not _acc(ev):
                                 continue
                             partner_offers.append(TradeOffer(
                                 partner_rid=partner_rid,
@@ -505,9 +573,38 @@ def recommend_offers(
                                 give=give, get=get, eval=ev,
                                 rationale=_build_rationale(ev, give, get, my_summary, their_summary)
                                           + "; big package",
-                                score=_score_offer(ev) * activity_mult,
+                                score=_sco(ev) * activity_mult,
                                 summary_line=_summary_line(give, get),
                             ))
+
+        # ---------------------------------------------------------------
+        # Pattern MEGA-XL: 4 of my picks (any mix) → their top player + their unmade pick.
+        # Surfaces the kind of 4-for-2 swap-up trades that actually happen in active SF
+        # drafts (e.g., JimMack/Stahov 4-pick-for-2-pick deal). Restricted to top-K assets
+        # to keep search bounded — C(10,4)=210 per partner is fast.
+        # ---------------------------------------------------------------
+        my_pool_all = sorted(
+            list(my_futures) + list(my_unmade),
+            key=lambda a: -a.consensus_value,
+        )[:10]
+        from itertools import combinations as _combos
+        for tp in their_top[:4]:
+            for tu in their_unmade[:4]:
+                for combo in _combos(my_pool_all, 4):
+                    give = list(combo)
+                    get = [tp, tu]
+                    ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
+                    if not _acc(ev):
+                        continue
+                    partner_offers.append(TradeOffer(
+                        partner_rid=partner_rid,
+                        partner_name=roster_name_fn(partner_rid),
+                        give=give, get=get, eval=ev,
+                        rationale=_build_rationale(ev, give, get, my_summary, their_summary)
+                                  + "; big package (4-for-2)",
+                        score=_sco(ev) * activity_mult,
+                        summary_line=_summary_line(give, get),
+                    ))
 
         # ---------------------------------------------------------------
         # Pattern MEGA-B: 2 of my future picks + 1 unmade startup pick → their top player
@@ -520,7 +617,7 @@ def recommend_offers(
                         give = [fp1, fp2, mu]
                         get = [tp]
                         ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                        if not _is_acceptable(ev):
+                        if not _acc(ev):
                             continue
                         partner_offers.append(TradeOffer(
                             partner_rid=partner_rid,
@@ -528,7 +625,7 @@ def recommend_offers(
                             give=give, get=get, eval=ev,
                             rationale=_build_rationale(ev, give, get, my_summary, their_summary)
                                       + "; big future-for-now",
-                            score=_score_offer(ev) * activity_mult,
+                            score=_sco(ev) * activity_mult,
                             summary_line=_summary_line(give, get),
                         ))
 
@@ -547,14 +644,14 @@ def recommend_offers(
                     give = [mp, sp_player]
                     get = [tp]
                     ev = evaluate_trade(give=give, get=get, cfg=cfg, my_roster_id=my_roster_id)
-                    if not _is_acceptable(ev):
+                    if not _acc(ev):
                         continue
                     partner_offers.append(TradeOffer(
                         partner_rid=partner_rid,
                         partner_name=roster_name_fn(partner_rid),
                         give=give, get=get, eval=ev,
                         rationale=_build_rationale(ev, give, get, my_summary, their_summary),
-                        score=_score_offer(ev) * activity_mult,
+                        score=_sco(ev) * activity_mult,
                         summary_line=_summary_line(give, get),
                     ))
 
@@ -574,3 +671,129 @@ def recommend_offers(
 
     all_offers.sort(key=lambda o: -o.score)
     return all_offers[:max_total]
+
+
+# ---------------------------------------------------------------------------
+# Reverse trade planner — "I want X, what do I give up?"
+
+
+def plan_acquisition(
+    state: DraftState,
+    valued_all: list[ValuedPlayer],
+    projections: dict[str, PlayerProjection],
+    pick_model: PickValueModel,
+    cfg: LeagueConfig,
+    my_roster_id: int,
+    partner_rid: int,
+    target_player_ids: list[str] | None = None,
+    target_picks: list[tuple[str, int, int]] | None = None,   # [(season, round, originator_rid), ...]
+    target_startup_picks: list[int] | None = None,            # [pick_no, ...] — their unmade startup picks
+    *,
+    max_combo_size: int = 5,
+    max_results: int = 10,
+    accept_threshold: float | None = None,
+    pool_cap_for_large_combos: int = 12,
+    roster_name_fn=None,
+) -> list[AcquisitionOption]:
+    """Reverse planner: given what you WANT from a partner, find cheapest packages to offer.
+
+    Returns AcquisitionOption list sorted by YOUR TW gain (best for you first), filtered
+    to trades the partner would plausibly accept (consensus_delta_for_them >= -100).
+
+    Args:
+        max_combo_size: largest "give" package to consider (1..max_combo_size assets).
+            Up to 5 supported. For sizes ≥ 4 the search restricts to the top
+            `pool_cap_for_large_combos` of your assets (by community value) to keep
+            combinatorics bounded — C(30,5) is too many to enumerate, C(12,5) is 792.
+        pool_cap_for_large_combos: how many of your top assets to consider when
+            searching combos of size ≥ 4. Lower = faster but may miss creative packages.
+    """
+    from itertools import combinations
+
+    roster_name_fn = roster_name_fn or (lambda rid: f"roster {rid}")
+    valued_by_id = {v.player_id: v for v in valued_all}
+    consensus_idx = build_consensus_index(projections, superflex=cfg.superflex)
+    drafted_ids = state.drafted_ids()
+    picks_already_made = len(state.picks)
+    pick_no_consensus = _build_pick_no_consensus_floor(state, valued_all, consensus_idx)
+
+    # 1. Build target asset list (what you want to GET)
+    get_assets: list[Asset] = []
+    for pid in (target_player_ids or []):
+        a = player_asset(pid, valued_all)
+        if a:
+            get_assets.append(a)
+    for season, rnd, orig in (target_picks or []):
+        label = f"{season} R{rnd}"
+        if orig != partner_rid:
+            label += f" (via {roster_name_fn(orig)})"
+        a = pick_asset(season, rnd, pick_model, original_roster_id=orig, label=label)
+        if a:
+            get_assets.append(a)
+    if target_startup_picks:
+        for sp in state.schedule:
+            if sp.made or sp.owner_roster_id != partner_rid:
+                continue
+            if sp.pick_no not in target_startup_picks:
+                continue
+            tw, cons = _value_unmade_pick(sp.pick_no, valued_all, consensus_idx, drafted_ids, picks_already_made)
+            get_assets.append(PickAsset(
+                season="startup", round=sp.round, tw_value=tw, consensus_value=cons,
+                original_roster_id=partner_rid,
+                label=f"pick {sp.pick_no} (R{sp.round}.{sp.slot_pos})",
+            ))
+
+    if not get_assets:
+        return []
+
+    # 2. Build my asset pool (everything I could offer)
+    my_players, my_futures, my_unmade = _gather_assets(
+        state=state, roster_id=my_roster_id,
+        valued_by_id=valued_by_id, valued_pool=valued_all,
+        consensus_idx=consensus_idx, pick_model=pick_model,
+        is_me=True, drafted_ids=drafted_ids,
+        pick_no_to_consensus_value=pick_no_consensus,
+        picks_already_made=picks_already_made,
+    )
+    pool: list[Asset] = list(my_players) + list(my_futures) + list(my_unmade)
+    if not pool:
+        return []
+
+    threshold = accept_threshold if accept_threshold is not None else -100.0
+
+    # For very large combo sizes (4+) the full enumeration would be ~30^5 = millions.
+    # Restrict to the top `pool_cap_for_large_combos` assets by community value when size >= 4.
+    pool_full = pool
+    pool_capped = sorted(pool, key=lambda a: -a.consensus_value)[:pool_cap_for_large_combos]
+
+    # 3. Enumerate combinations of MY assets
+    seen_keys: set[tuple] = set()
+    candidates: list[AcquisitionOption] = []
+    for size in range(1, max_combo_size + 1):
+        search_pool = pool_full if size <= 3 else pool_capped
+        for combo in combinations(search_pool, size):
+            key = tuple(sorted(
+                (a.player_id if isinstance(a, PlayerAsset)
+                 else f"pick:{a.season}:{a.round}:{a.original_roster_id}")
+                for a in combo
+            ))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            ev = evaluate_trade(give=list(combo), get=get_assets, cfg=cfg, my_roster_id=my_roster_id)
+            if ev.consensus_delta_for_them < threshold:
+                continue
+
+            give_str = ", ".join(
+                (a.name if isinstance(a, PlayerAsset) else a.label) for a in combo
+            )
+            candidates.append(AcquisitionOption(
+                give=list(combo),
+                get=get_assets,
+                eval=ev,
+                summary_line=give_str,
+            ))
+
+    candidates.sort(key=lambda o: -o.eval.tw_delta)
+    return candidates[:max_results]
