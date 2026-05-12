@@ -1,0 +1,15 @@
+# Sleeper Cell — Phase 1 dependencies
+# Pin minor versions to avoid drift. Bump with intent.
+
+streamlit>=1.40,<2.0
+streamlit-autorefresh>=1.0,<2.0
+requests>=2.32,<3.0
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+pydantic>=2.7,<3.0
+rapidfuzz>=3.9,<4.0          # fuzzy name matching for player index fallback
+pyyaml>=6.0,<7.0             # bylaw / league config files
+
+# dev / test
+pytest>=8.0,<9.0
+pytest-cov>=5.0,<7.0

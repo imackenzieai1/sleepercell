@@ -1,0 +1,56 @@
+# --- references: study material, not redistributable ---
+# Three audited reference repos. Keep them locally for inspection,
+# but never commit them — total ~280MB, mixed licenses (one GPL-3, one BSD-3, one unlicensed).
+# See docs/REFERENCE_AUDIT.md for what they are and why we have them.
+references/
+
+# --- runtime data caches ---
+# Match files in data/ AND any subdirectory (data/sleeper/, data/dp/, etc.).
+# Cached payloads from Sleeper + DynastyProcess go here at runtime; never commit.
+data/**/*.csv
+data/**/*.parquet
+data/**/*.json
+data/**/*.txt
+data/*.csv
+data/*.parquet
+data/*.json
+data/*.txt
+!data/.gitkeep
+!data/sample_*.csv
+
+# --- Streamlit secrets (never commit) ---
+.streamlit/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv lockfile — KEEP this committed for reproducibility (do not gitignore uv.lock).
+# Listing it here as a reminder, NOT as an exclusion.
+# Equivalent of poetry.lock / package-lock.json.
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- build / dist ---
+build/
+dist/
+*.egg
